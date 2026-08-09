@@ -474,15 +474,25 @@ impl Timeline {
         self.send_attachment(params, AttachmentInfo::Voice(info), audio_info.mimetype, None)
     }
 
+    /// Send a file attachment, optionally with a thumbnail.
+    ///
+    /// A thumbnail is uploaded when both `thumbnail_source` and
+    /// `file_info.thumbnail_info` are set; if only one of them is provided it
+    /// is ignored. This is useful for file types a client can render a preview
+    /// for but that aren't images or videos themselves, e.g. the first page of
+    /// a PDF.
+    #[uniffi::method(default(thumbnail_source = None))]
     pub fn send_file(
         self: Arc<Self>,
         params: UploadParameters,
         file_info: FileInfo,
+        thumbnail_source: Option<UploadSource>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::File(
             BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?,
         );
-        self.send_attachment(params, attachment_info, file_info.mimetype, None)
+        let thumbnail = build_thumbnail_info(thumbnail_source, file_info.thumbnail_info)?;
+        self.send_attachment(params, attachment_info, file_info.mimetype, thumbnail)
     }
 
     pub async fn create_poll(
