@@ -148,6 +148,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [build-dependencies]
+cc = "1"
 uniffi = { workspace = true, features = ["build"] }
 vergen-gitcl = { workspace = true, features = ["build"] }
 
