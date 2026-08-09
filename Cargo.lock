@@ -3745,6 +3745,7 @@ dependencies = [
  "anyhow",
  "async-compat",
  "async-trait",
+ "cc",
  "chrono",
  "console_error_panic_hook",
  "extension-trait",

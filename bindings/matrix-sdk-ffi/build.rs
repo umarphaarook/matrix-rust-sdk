@@ -80,6 +80,34 @@ fn setup_watchos_simulator_workaround() {
     }
 }
 
+/// Links a definition of `sdallocx` into Android builds, to work around a
+/// dynamic-symbol collision with React Native. See
+/// [../shim/sdallocx_android.c] for the full explanation of the crash.
+///
+/// The compiled object is put directly on the link line instead of being
+/// linked as a static library: AWS-LC's reference to `sdallocx` is *weak*, and
+/// a weak undefined reference does not pull a member out of an archive, so a
+/// plain `cargo:rustc-link-lib=static=…` would leave the shim silently
+/// unlinked and the crash unfixed.
+fn setup_android_sdallocx_shim() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+    if target_os != "android" {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=shim/sdallocx_android.c");
+
+    let objects = cc::Build::new()
+        .file("shim/sdallocx_android.c")
+        // We emit the link flags ourselves, below.
+        .cargo_metadata(false)
+        .compile_intermediates();
+
+    for object in objects {
+        println!("cargo:rustc-link-arg={}", object.display());
+    }
+}
+
 /// Run the clang binary at `clang_path`, and return its major version number
 fn get_clang_major_version(clang_path: &Path) -> String {
     let clang_output =
@@ -95,6 +123,7 @@ fn get_clang_major_version(clang_path: &Path) -> String {
 
 fn main() -> Result<(), Box<dyn Error>> {
     setup_x86_64_android_workaround();
+    setup_android_sdallocx_shim();
     setup_watchos_simulator_workaround();
     uniffi::generate_scaffolding("./src/api.udl").expect("Building the UDL file failed");
 
