@@ -14,7 +14,7 @@
 
 use matrix_sdk::{Client, Room, latest_events::LocalLatestEventValue};
 use matrix_sdk_base::latest_event::LatestEventValue as BaseLatestEventValue;
-use ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId};
+use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId};
 use tracing::trace;
 
 use crate::timeline::{
@@ -30,6 +30,14 @@ pub enum LatestEventValue {
 
     /// The latest event represents a remote event.
     Remote {
+        /// The ID of the remote event, if it carries one.
+        ///
+        /// This is `None` only for a malformed event with no `event_id`; it is
+        /// otherwise always set for a remote event. It is exposed so a consumer
+        /// can correlate this value with per-event data it holds elsewhere —
+        /// read receipts, for instance — without opening a timeline.
+        event_id: Option<OwnedEventId>,
+
         /// The timestamp of the remote event.
         timestamp: MilliSecondsSinceUnixEpoch,
 
@@ -62,6 +70,13 @@ pub enum LatestEventValue {
     /// cannot be sent, either because a previous local event, or this local
     /// event cannot be sent.
     Local {
+        /// The ID of the local event, if it has one already.
+        ///
+        /// A local event only has an ID once it has been sent and the server
+        /// has acknowledged it (see [`LatestEventValueLocalState::HasBeenSent`]);
+        /// while it is sending, or if it cannot be sent, this is `None`.
+        event_id: Option<OwnedEventId>,
+
         /// The timestamp of the local event.
         timestamp: MilliSecondsSinceUnixEpoch,
 
@@ -93,6 +108,11 @@ impl LatestEventValue {
         room: &Room,
         client: &Client,
     ) -> Self {
+        // Read the event ID off the base value before it is consumed below. The base
+        // type already knows which of its variants carry one, so defer to it rather
+        // than re-deriving that per variant here.
+        let event_id = value.event_id();
+
         match value {
             BaseLatestEventValue::None => Self::None,
             BaseLatestEventValue::Remote(timeline_event) => {
@@ -108,7 +128,9 @@ impl LatestEventValue {
                     TimelineDetails::from_initial_value(Profile::load(room, &sender).await);
 
                 match TimelineItemContent::from_event(room, timeline_event).await {
-                    Some(content) => Self::Remote { timestamp, sender, is_own, profile, content },
+                    Some(content) => {
+                        Self::Remote { event_id, timestamp, sender, is_own, profile, content }
+                    }
                     None => Self::None,
                 }
             }
@@ -137,6 +159,7 @@ impl LatestEventValue {
 
                 match TimelineAction::from_content(message_like_event_content, None, None, None) {
                     TimelineAction::AddItem { content } => Self::Local {
+                        event_id,
                         timestamp: *timestamp,
                         sender,
                         profile,
@@ -228,7 +251,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$ev0")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
             assert!(is_own.not());
@@ -280,7 +304,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Local { timestamp, sender, profile, content, state } => {
+        assert_matches!(value, LatestEventValue::Local { event_id, timestamp, sender, profile, content, state } => {
+            assert!(event_id.is_none());
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(sender, "@example:localhost");
             assert_matches!(profile, TimelineDetails::Unavailable);
@@ -311,7 +336,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Local { timestamp, sender, profile, content, state } => {
+        assert_matches!(value, LatestEventValue::Local { event_id, timestamp, sender, profile, content, state } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$ev0")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(sender, "@example:localhost");
             assert_matches!(profile, TimelineDetails::Unavailable);
@@ -339,7 +365,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Local { timestamp, sender, profile, content, state } => {
+        assert_matches!(value, LatestEventValue::Local { event_id, timestamp, sender, profile, content, state } => {
+            assert!(event_id.is_none());
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(sender, "@example:localhost");
             assert_matches!(profile, TimelineDetails::Unavailable);
@@ -371,7 +398,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$ev1")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
             assert!(is_own.not());
@@ -405,7 +433,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$beacon-stop")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
             assert!(is_own.not());
@@ -452,7 +481,8 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$beacon-start-2")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
             assert!(is_own.not());
