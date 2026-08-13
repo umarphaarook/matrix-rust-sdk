@@ -1438,6 +1438,10 @@ impl LazyTimelineItemProvider {
 pub enum LatestEventValue {
     None,
     Remote {
+        /// The ID of the event, absent only for a malformed event that carries
+        /// none. Lets a client correlate this value with per-event data it holds
+        /// elsewhere (read receipts, for instance) without opening a timeline.
+        event_id: Option<String>,
         timestamp: Timestamp,
         sender: String,
         is_own: bool,
@@ -1450,6 +1454,9 @@ pub enum LatestEventValue {
         inviter_profile: ProfileDetails,
     },
     Local {
+        /// The ID of the event, set only once it has been sent and acknowledged
+        /// by the server (see [`LatestEventValueLocalState::HasBeenSent`]).
+        event_id: Option<String>,
         timestamp: Timestamp,
         sender: String,
         profile: ProfileDetails,
@@ -1462,8 +1469,9 @@ impl From<UiLatestEventValue> for LatestEventValue {
     fn from(value: UiLatestEventValue) -> Self {
         match value {
             UiLatestEventValue::None => Self::None,
-            UiLatestEventValue::Remote { timestamp, sender, is_own, profile, content } => {
+            UiLatestEventValue::Remote { event_id, timestamp, sender, is_own, profile, content } => {
                 Self::Remote {
+                    event_id: event_id.map(|event_id| event_id.to_string()),
                     timestamp: timestamp.into(),
                     sender: sender.to_string(),
                     is_own,
@@ -1478,8 +1486,9 @@ impl From<UiLatestEventValue> for LatestEventValue {
                     inviter_profile: inviter_profile.into(),
                 }
             }
-            UiLatestEventValue::Local { timestamp, sender, profile, content, state } => {
+            UiLatestEventValue::Local { event_id, timestamp, sender, profile, content, state } => {
                 Self::Local {
+                    event_id: event_id.map(|event_id| event_id.to_string()),
                     timestamp: timestamp.into(),
                     sender: sender.to_string(),
                     profile: profile.into(),
