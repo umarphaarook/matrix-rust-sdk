@@ -28,9 +28,10 @@ use matrix_sdk_base::{
 };
 use matrix_sdk_common::executor::spawn;
 use ruma::{
-    EventId, OwnedEventId, OwnedRoomId, OwnedUserId,
+    EventId, OwnedEventId, OwnedRoomId, OwnedUserId, UserId,
     events::{
-        receipt::ReceiptEventContent, relation::RelationType,
+        receipt::{ReceiptEventContent, ReceiptThread},
+        relation::RelationType,
         room::redaction::SyncRoomRedactionEvent,
     },
     room_version_rules::RoomVersionRules,
@@ -674,6 +675,23 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             if let Err(error) = result {
                 error!(room_id = ?room.room_id(), ?error, "Failed to save the changes");
             }
+        } else if let Some(receipt_event) = receipt_event
+            && let Some(latest_event_id) = room.latest_event().event_id()
+            && receipt_targets_event_from_another_user(
+                receipt_event,
+                &self.state.own_user_id,
+                &latest_event_id,
+            )
+        {
+            // Another user's read receipt never moves our own unread counts, so the
+            // branch above cannot fire for it — yet a receipt landing on the room's
+            // latest event changes that event's read state, which observers (a room
+            // list rendering read ticks, say) may present. Notify them, without
+            // modifying the stored `RoomInfo`.
+            room.update_room_info(|room_info| {
+                (room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
+            })
+            .await;
         }
 
         Ok(())
@@ -833,11 +851,44 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     }
 }
 
+/// Whether `receipt_event` carries an unthreaded or main-thread receipt from
+/// any user other than `own_user_id` targeting `event_id`.
+///
+/// Threaded receipts are excluded for the same reason they are in
+/// [`select_best_receipt`](super::super::read_receipts): a thread-scoped
+/// receipt says nothing about the unthreaded read state of the event.
+fn receipt_targets_event_from_another_user(
+    receipt_event: &ReceiptEventContent,
+    own_user_id: &UserId,
+    event_id: &EventId,
+) -> bool {
+    receipt_event.0.get(event_id).is_some_and(|receipts| {
+        receipts.iter().any(|(_receipt_type, users)| {
+            users.iter().any(|(user_id, receipt)| {
+                user_id != own_user_id
+                    && matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded)
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_base::RoomState;
+    use assert_matches::assert_matches;
+    use matrix_sdk_base::{
+        RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
+        latest_event::LatestEventValue,
+        sync::{JoinedRoomUpdate, Timeline},
+    };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
-    use ruma::{event_id, room_id, user_id};
+    use ruma::{
+        event_id,
+        events::{
+            AnySyncEphemeralRoomEvent,
+            receipt::{ReceiptThread, ReceiptType},
+        },
+        room_id, user_id,
+    };
 
     use crate::test_utils::logged_in_client;
 
@@ -868,5 +919,110 @@ mod tests {
 
         // Retrieving the event at the room-wide cache works.
         assert!(room_event_cache.find_event(event_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn test_peer_receipt_on_latest_event_notifies_room_info_observers() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+        let own_user_id = client.user_id().unwrap();
+        let peer = user_id!("@ben:saucisse.bzh");
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        // The current user sent the latest event of the room.
+        let f = EventFactory::new().room(room_id).sender(own_user_id);
+        let latest_event_id = event_id!("$1");
+
+        room_event_cache
+            .handle_joined_room_update(JoinedRoomUpdate {
+                timeline: Timeline {
+                    limited: false,
+                    prev_batch: None,
+                    events: vec![f.text_msg("hello").event_id(latest_event_id).into_event()],
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The latest event value is normally maintained by the latest events
+        // module, which isn't running here: set it by hand.
+        room.update_room_info(|mut room_info| {
+            room_info.set_latest_event(LatestEventValue::Remote(
+                f.text_msg("hello").event_id(latest_event_id).into_event(),
+            ));
+            (room_info, RoomInfoNotableUpdateReasons::LATEST_EVENT)
+        })
+        .await;
+
+        let mut room_info_notable_update_stream = client.room_info_notable_update_receiver();
+
+        // A peer's receipt targeting the latest event arrives alone. It changes no
+        // unread count of ours, but observers must still hear about it.
+        let receipt = f
+            .read_receipts()
+            .add(latest_event_id, peer, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_event()
+            .into_raw::<AnySyncEphemeralRoomEvent>();
+
+        room_event_cache
+            .handle_joined_room_update(JoinedRoomUpdate {
+                ephemeral: vec![receipt],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_matches!(
+            room_info_notable_update_stream.recv().await,
+            Ok(RoomInfoNotableUpdate { room_id: received_room_id, reasons }) => {
+                assert_eq!(received_room_id, room_id);
+                assert!(reasons.contains(RoomInfoNotableUpdateReasons::READ_RECEIPT), "{reasons:?}");
+            }
+        );
+        assert!(room_info_notable_update_stream.is_empty());
+
+        // A peer's receipt targeting an OLDER event cannot change what a room
+        // list shows for the latest event: no notification.
+        let stale_receipt = f
+            .read_receipts()
+            .add(event_id!("$0"), peer, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_event()
+            .into_raw::<AnySyncEphemeralRoomEvent>();
+
+        room_event_cache
+            .handle_joined_room_update(JoinedRoomUpdate {
+                ephemeral: vec![stale_receipt],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(room_info_notable_update_stream.is_empty());
+
+        // Our own receipt on the latest event, when nothing it tracks changes,
+        // must not re-notify either: only another user's receipt can change the
+        // latest event's read state as seen by others.
+        let own_receipt = f
+            .read_receipts()
+            .add(latest_event_id, own_user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_event()
+            .into_raw::<AnySyncEphemeralRoomEvent>();
+
+        room_event_cache
+            .handle_joined_room_update(JoinedRoomUpdate {
+                ephemeral: vec![own_receipt],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(room_info_notable_update_stream.is_empty());
     }
 }
