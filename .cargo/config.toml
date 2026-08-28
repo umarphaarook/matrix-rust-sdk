@@ -9,7 +9,13 @@ crates-io = "https://docs.rs/"
 rustdoc-map = true
 
 [target.aarch64-linux-android]
-# These rust flags improve the performance on Android on arm64
+# These rust flags improve the performance on Android on arm64.
+# +sha3 is deliberately NOT enabled: it makes the sha2 crate emit FEAT_SHA512
+# instructions unconditionally, which SIGILLs on cores without the optional
+# extension (device-proven: Pixel 6 Tensor G1, Cortex-X1/A76 — crash in
+# sha2::sha512::compress512 during olm account creation at first login).
+# Without the flag the crate falls back to runtime detection, so devices that
+# DO have FEAT_SHA512 keep the fast path.
 rustflags = ["-C", "target-feature=+neon,+aes,+sha2,+pmuv3"]
 
 [env]
