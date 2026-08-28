@@ -2461,6 +2461,123 @@ async fn test_clear_all_rooms() {
 }
 
 #[async_test]
+async fn test_clear_room() {
+    let sleeping_room_id = room_id!("!dodo:saucisse.bzh");
+    let event_cache_store = Arc::new(MemoryStore::new());
+
+    let f = EventFactory::new().room(sleeping_room_id);
+    let ev0 = f.text_msg("hi").sender(*ALICE).event_id(event_id!("$ev0")).into_event();
+
+    // Feed the cache with one room with one event, before the client is created.
+    // This room will remain sleeping.
+    {
+        let cid = ChunkIdentifier::new(0);
+        event_cache_store
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(sleeping_room_id),
+                vec![
+                    Update::NewItemsChunk { previous: None, new: cid, next: None },
+                    Update::PushItems { at: Position::new(cid, 0), items: vec![ev0] },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::multi_process("hodlor"))
+                    .event_cache_store(event_cache_store.clone()),
+            )
+        })
+        .build()
+        .await;
+
+    client.event_cache().subscribe().unwrap();
+
+    // Another room gets a live event: it's loaded in the event cache now, while
+    // sleeping_room_id is not.
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("bonchourhan").sender(*BOB).event_id(event_id!("$ev1")),
+            ),
+        )
+        .await;
+
+    let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let (initial, mut room_updates) = room_event_cache.subscribe().await.unwrap();
+
+    let mut initial = Vector::from(initial);
+    // Wait for the ev1 event.
+    if initial.is_empty() {
+        assert_let_timeout!(
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                room_updates.recv()
+        );
+        assert_eq!(diffs.len(), 1);
+        assert_matches!(diffs[0], VectorDiff::Append { .. });
+        diffs[0].clone().apply(&mut initial);
+    }
+    // The room state now contains one event.
+    assert_eq!(initial.len(), 1);
+    assert_event_id!(initial[0], "$ev1");
+
+    // Now, clear that single room.
+    client.event_cache().clear_room(room_id).await.unwrap();
+
+    // We should get an update for the cleared room.
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+            room_updates.recv()
+    );
+    assert_eq!(diffs.len(), 1);
+    assert_let!(VectorDiff::Clear = &diffs[0]);
+
+    // Its store is empty.
+    let (maybe_last_chunk, _chunk_id_gen) =
+        event_cache_store.load_last_chunk(LinkedChunkId::Room(room_id)).await.unwrap();
+    assert!(maybe_last_chunk.is_none());
+
+    // But the OTHER room's store is untouched: the clear was scoped.
+    let (maybe_last_chunk, _chunk_id_gen) =
+        event_cache_store.load_last_chunk(LinkedChunkId::Room(sleeping_room_id)).await.unwrap();
+    assert!(maybe_last_chunk.is_some());
+
+    // The subscriber survives the clear: a new sync event still reaches it,
+    // unlike after a `forget_room`.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("still alive").sender(*BOB).event_id(event_id!("$ev2")),
+            ),
+        )
+        .await;
+
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+            room_updates.recv()
+    );
+    assert_eq!(diffs.len(), 1);
+    assert_matches!(&diffs[0], VectorDiff::Append { values } => {
+        assert_eq!(values.len(), 1);
+        assert_event_id!(values[0], "$ev2");
+    });
+
+    // Clearing a room that was never loaded in memory also reaches its store.
+    client.event_cache().clear_room(sleeping_room_id).await.unwrap();
+    let (maybe_last_chunk, _chunk_id_gen) =
+        event_cache_store.load_last_chunk(LinkedChunkId::Room(sleeping_room_id)).await.unwrap();
+    assert!(maybe_last_chunk.is_none());
+}
+
+#[async_test]
 async fn test_sync_while_back_paginate() {
     let server = MatrixMockServer::new().await;
 

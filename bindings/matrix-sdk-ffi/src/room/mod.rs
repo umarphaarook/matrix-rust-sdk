@@ -1054,6 +1054,19 @@ impl Room {
         Ok(cache.debug_string().await)
     }
 
+    /// Clear this room's persisted event cache, in memory and in the store,
+    /// keeping live observers alive; the next pagination or sync re-fetches
+    /// the room's history from the homeserver.
+    ///
+    /// This is a repair for a local history suspected to be missing events:
+    /// a rebuilt store re-asks the homeserver for ranges a corrupted one
+    /// believes it already holds. Callers should rebuild any open timeline
+    /// afterwards.
+    pub async fn clear_event_cache(&self) -> Result<(), ClientError> {
+        self.inner.client().event_cache().clear_room(self.inner.room_id()).await?;
+        Ok(())
+    }
+
     /// Update the canonical alias of the room.
     ///
     /// Note that publishing the alias in the room directory is done separately.
