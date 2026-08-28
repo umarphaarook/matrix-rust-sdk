@@ -468,6 +468,16 @@ impl EventCache {
         self.inner.forget_room(room_id).await
     }
 
+    /// Cleanly clear a single room's event cache, in memory and in the store.
+    ///
+    /// Unlike [`EventCache::forget_room`], the room's live caches are kept
+    /// alive, so existing observers keep receiving updates; they will be
+    /// notified that the room has been cleared. The next pagination or sync
+    /// re-fetches the room's history from the homeserver.
+    pub async fn clear_room(&self, room_id: &RoomId) -> Result<()> {
+        self.inner.clear_room(room_id).await
+    }
+
     /// Cleanly clear all the rooms' event caches.
     ///
     /// This will notify any live observers that the room has been cleared.
@@ -638,6 +648,19 @@ impl EventCacheInner {
 
         // Finally, we forget all the caches if any exists in memory.
         caches_for_all_rooms.remove(room_id);
+
+        Ok(())
+    }
+
+    /// Clear a single room's data, keeping its live caches — and therefore
+    /// any observers — alive.
+    async fn clear_room(&self, room_id: &RoomId) -> Result<()> {
+        // Same constraints as `clear_all_rooms`, scoped to a single room: the
+        // exclusive lock over all the caches is required by
+        // `clear_and_reload`, and the `by_room` map must NOT lose the entry,
+        // or subscribers would silently stop receiving updates.
+        let caches_for_all_rooms = self.by_room.write().await;
+        self.state.clear_and_reload(&caches_for_all_rooms, Some(room_id)).await?;
 
         Ok(())
     }
