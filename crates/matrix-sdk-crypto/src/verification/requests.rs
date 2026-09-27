@@ -801,6 +801,13 @@ impl VerificationRequest {
         }
     }
 
+    pub(crate) fn receive_cancel_from_own_device(&self, content: &CancelContent<'_>) {
+        let mut guard = self.inner.write();
+        if let Some(updated) = guard.cancel(false, content.cancel_code()) {
+            ObservableWriteGuard::set(&mut guard, updated);
+        }
+    }
+
     fn start_sas_helper(
         &self,
         new_state: RequestState<Transitioned>,

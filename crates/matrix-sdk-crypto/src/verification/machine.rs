@@ -159,6 +159,16 @@ impl VerificationMachine {
         self.requests.read().get(user_id).map(|v| v.values().cloned().collect()).unwrap_or_default()
     }
 
+    fn get_room_request_by_flow_id(&self, flow_id: &FlowId) -> Option<VerificationRequest> {
+        flow_id.room_id()?;
+        self.requests
+            .read()
+            .values()
+            .flat_map(|requests| requests.values())
+            .find(|request| request.flow_id() == flow_id)
+            .cloned()
+    }
+
     /// Add a new `VerificationRequest` object to the cache.
     /// If there are any existing requests with this user (and different
     /// flow_id), both the existing and new request will be cancelled.
@@ -389,6 +399,13 @@ impl VerificationMachine {
             AnyVerificationContent::Cancel(c) => {
                 if let Some(verification) = self.get_request(event.sender(), flow_id.as_str()) {
                     verification.receive_cancel(event.sender(), c);
+                } else if event.is_room_event() && event.sender() == self.own_user_id() {
+                    // An in-room cancellation from another of our own devices belongs
+                    // to the request's original peer, not to our user-ID map entry.
+                    // Retire that request before a retry arrives from the same peer.
+                    if let Some(request) = self.get_room_request_by_flow_id(&flow_id) {
+                        request.receive_cancel_from_own_device(c);
+                    }
                 }
 
                 if let Some(verification) = self.get_verification(event.sender(), flow_id.as_str())
@@ -550,7 +567,7 @@ mod tests {
     use std::sync::Arc;
 
     use matrix_sdk_test::async_test;
-    use ruma::TransactionId;
+    use ruma::{TransactionId, event_id, room_id};
     use tokio::sync::Mutex;
 
     use super::{Sas, VerificationMachine};
@@ -562,7 +579,7 @@ mod tests {
             FlowId, VerificationStore,
             cache::VerificationCache,
             event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent},
-            tests::{alice_device_id, alice_id, setup_stores, wrap_any_to_device_content},
+            tests::{alice_device_id, alice_id, bob_id, setup_stores, wrap_any_to_device_content},
         },
     };
 
@@ -786,6 +803,68 @@ mod tests {
         // Make sure both of them are cancelled.
         assert!(alice_request.is_cancelled());
         assert!(second_request.is_cancelled());
+    }
+
+    #[async_test]
+    async fn test_own_room_cancel_retires_request_before_retry() {
+        let (machine, _) = verification_machine().await;
+        let room_id = room_id!("!verification:example.org");
+        let first_event_id = event_id!("$first:example.org");
+        let first = VerificationRequest::new(
+            machine.verifications.clone(),
+            machine.store.clone(),
+            FlowId::InRoom(room_id.to_owned(), first_event_id.to_owned()),
+            bob_id(),
+            vec![],
+            None,
+        );
+        machine.insert_request(first.clone());
+
+        // A different device on our account cancelled the in-room exchange.
+        // This device must not retain the old request and cancel the next one.
+        let unrelated: ruma::events::AnyMessageLikeEvent =
+            serde_json::from_value(serde_json::json!({
+                "type": "m.key.verification.cancel",
+                "room_id": room_id,
+                "sender": alice_id(),
+                "event_id": "$unrelated_cancel:example.org",
+                "origin_server_ts": 1,
+                "content": {
+                    "code": "m.user",
+                    "reason": "User cancelled",
+                    "m.relates_to": { "rel_type": "m.reference", "event_id": "$other:example.org" }
+                }
+            }))
+            .unwrap();
+        machine.receive_any_event(&unrelated).await.unwrap();
+        assert!(!first.is_cancelled());
+
+        let cancel: ruma::events::AnyMessageLikeEvent = serde_json::from_value(serde_json::json!({
+            "type": "m.key.verification.cancel",
+            "room_id": room_id,
+            "sender": alice_id(),
+            "event_id": "$cancel:example.org",
+            "origin_server_ts": 1,
+            "content": {
+                "code": "m.user",
+                "reason": "User cancelled",
+                "m.relates_to": { "rel_type": "m.reference", "event_id": first_event_id }
+            }
+        }))
+        .unwrap();
+        machine.receive_any_event(&cancel).await.unwrap();
+        assert!(first.is_cancelled());
+
+        let retry = VerificationRequest::new(
+            machine.verifications.clone(),
+            machine.store.clone(),
+            FlowId::InRoom(room_id.to_owned(), event_id!("$retry:example.org").to_owned()),
+            bob_id(),
+            vec![],
+            None,
+        );
+        machine.insert_request(retry.clone());
+        assert!(!retry.is_cancelled());
     }
 
     /// Ensure that if a duplicate request is added (i.e. matching user and
