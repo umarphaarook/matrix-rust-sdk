@@ -170,8 +170,8 @@ impl VerificationMachine {
     }
 
     /// Add a new `VerificationRequest` object to the cache.
-    /// If there are any existing requests with this user (and different
-    /// flow_id), both the existing and new request will be cancelled.
+    /// If the same device initiated another active request with a different
+    /// flow ID, cancel both. Requests from different devices are independent.
     fn insert_request(&self, request: VerificationRequest) {
         if let Some(r) = self.get_request(request.other_user(), request.flow_id().as_str()) {
             debug!(flow_id = r.flow_id().as_str(), "Ignoring known verification request",);
@@ -181,14 +181,28 @@ impl VerificationMachine {
         let mut requests = self.requests.write();
         let user_requests = requests.entry(request.other_user().to_owned()).or_default();
 
-        // Cancel all the old verifications requests as well as the new one we
-        // have for this user if someone tries to have two verifications going
-        // on at once.
+        let initiating_device = |verification: &VerificationRequest| {
+            if verification.we_started() {
+                Some(self.own_device_id().to_owned())
+            } else {
+                verification.other_device_id()
+            }
+        };
+        let new_initiator = initiating_device(&request);
+
+        // The same initiating device must not run multiple verifications at
+        // once. Another device of that user may have an unrelated request;
+        // cancelling it would also destroy an active SAS exchange.
         for old_verification in user_requests.values_mut() {
-            if !old_verification.is_cancelled() {
+            if !old_verification.is_cancelled()
+                && !old_verification.is_done()
+                && !old_verification.is_passive()
+                && new_initiator.is_some()
+                && initiating_device(old_verification) == new_initiator
+            {
                 warn!(
                     "Received a new verification request whilst another request \
-                    with the same user is ongoing. Cancelling both requests."
+                    from the same device is ongoing. Cancelling both requests."
                 );
 
                 if let Some(r) = old_verification.cancel() {
@@ -567,18 +581,18 @@ mod tests {
     use std::sync::Arc;
 
     use matrix_sdk_test::async_test;
-    use ruma::{TransactionId, event_id, room_id};
+    use ruma::{TransactionId, device_id, event_id, room_id};
     use tokio::sync::Mutex;
 
     use super::{Sas, VerificationMachine};
     use crate::{
-        Account, VerificationRequest,
+        Account, DeviceData, VerificationRequest,
         olm::PrivateCrossSigningIdentity,
         store::{CryptoStoreWrapper, MemoryStore},
         verification::{
             FlowId, VerificationStore,
             cache::VerificationCache,
-            event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent},
+            event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent, RequestContent},
             tests::{alice_device_id, alice_id, bob_id, setup_stores, wrap_any_to_device_content},
         },
     };
@@ -865,6 +879,65 @@ mod tests {
         );
         machine.insert_request(retry.clone());
         assert!(!retry.is_cancelled());
+    }
+
+    /// A distinct device of the same user may request verification without
+    /// cancelling an active SAS exchange with the first device.
+    #[async_test]
+    async fn test_distinct_devices_preserve_active_verification() {
+        let (machine, bob_store) = verification_machine().await;
+        let first_sender = VerificationRequest::new(
+            VerificationCache::new(),
+            bob_store.clone(),
+            FlowId::ToDevice("FIRST_FLOW".into()),
+            alice_id(),
+            vec![],
+            None,
+        );
+        let first_outgoing = first_sender.request_to_device();
+        machine
+            .receive_any_event(&wrap_any_to_device_content(
+                first_sender.own_user_id(),
+                first_outgoing.try_into().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let first = machine.get_request(bob_id(), first_sender.flow_id().as_str()).unwrap();
+        first.accept().unwrap();
+        let (first_sas, _) = first.start_sas().await.unwrap().unwrap();
+        assert!(!first_sas.is_cancelled());
+
+        let second_account = Account::with_device_id(bob_id(), device_id!("BOBSECOND"));
+        let second_store =
+            VerificationStore { account: second_account.static_data.clone(), ..bob_store };
+        let second_sender = VerificationRequest::new(
+            VerificationCache::new(),
+            second_store,
+            FlowId::ToDevice("SECOND_FLOW".into()),
+            alice_id(),
+            vec![],
+            None,
+        );
+        let second_outgoing = second_sender.request_to_device();
+        let second_content: OutgoingContent = second_outgoing.try_into().unwrap();
+        let second = VerificationRequest::from_request(
+            machine.verifications.clone(),
+            machine.store.clone(),
+            bob_id(),
+            second_sender.flow_id().clone(),
+            &RequestContent::try_from(&second_content).unwrap(),
+            DeviceData::from_account(&second_account),
+        );
+        machine.insert_request(second.clone());
+
+        assert!(!first.is_cancelled());
+        assert!(!first_sas.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert_eq!(machine.get_request(bob_id(), "FIRST_FLOW").unwrap().flow_id(), first.flow_id());
+        assert_eq!(
+            machine.get_request(bob_id(), "SECOND_FLOW").unwrap().flow_id(),
+            second.flow_id()
+        );
     }
 
     /// Ensure that if a duplicate request is added (i.e. matching user and
