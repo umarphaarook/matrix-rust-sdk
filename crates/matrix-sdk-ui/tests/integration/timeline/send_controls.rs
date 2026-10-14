@@ -425,7 +425,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::NotSentYet { .. })
@@ -434,7 +434,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::SendingFailed { is_recoverable: false, .. })
@@ -447,7 +447,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    assert!(item.as_event().unwrap().reactions().get(key).is_none());
+    assert!(item.as_event().unwrap().content().reactions().unwrap().get(key).is_none());
 
     // Again, this time retrying.
     timeline.toggle_reaction(&item_id, key).await.unwrap();
@@ -455,7 +455,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::NotSentYet { .. })
@@ -464,7 +464,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::SendingFailed { is_recoverable: false, .. })
@@ -475,7 +475,7 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_let_timeout!(Some(updates) = stream.next());
     assert_eq!(updates.len(), 1);
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::NotSentYet { .. })
@@ -486,14 +486,14 @@ async fn test_abort_and_retry_failed_reaction() {
     assert_eq!(updates.len(), 2);
 
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[0]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(
         reactions.get(key).unwrap().get(user_id).unwrap().send_state,
         Some(EventSendState::Sent { .. })
     );
 
     assert_let!(VectorDiff::Set { index: 1, value: item } = &updates[1]);
-    let reactions = item.as_event().unwrap().reactions();
+    let reactions = item.as_event().unwrap().content().reactions().unwrap();
     assert_matches!(reactions.get(key).unwrap().get(user_id).unwrap().send_state, None);
 
     assert_pending!(stream);
