@@ -226,6 +226,7 @@ impl ClientBuilder {
             room_key_recipient_strategy: Default::default(),
             decryption_settings: DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
             },
             enable_share_history_on_invite: false,
             disable_well_known_lookup: false,
@@ -410,6 +411,12 @@ impl ClientBuilder {
     }
 
     /// Set the trust requirement to be used when decrypting events.
+    ///
+    /// With `TrustRequirement::CrossSignedOrLegacy`, also set
+    /// `refuse_legacy_from_unsigned_known_devices` to refuse a legacy session
+    /// (for instance one restored from key backup) whose sender device we know
+    /// and that is not cross-signed by its owner. See
+    /// [`DecryptionSettings::refuse_legacy_from_unsigned_known_devices`].
     pub fn decryption_settings(
         self: Arc<Self>,
         decryption_settings: DecryptionSettings,

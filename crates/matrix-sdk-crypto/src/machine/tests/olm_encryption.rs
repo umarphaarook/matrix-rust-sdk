@@ -215,8 +215,10 @@ async fn olm_encryption_test_helper(use_fallback_key: bool) {
             .expect("We should be able to deserialize the encrypted content"),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Decrypting the first time should succeed.
     let decrypted = bob
@@ -302,8 +304,10 @@ async fn test_decrypt_to_device_message_with_unsigned_sender_keys() {
         alice_session.build_encrypted_event(ciphertext, None).await.unwrap(),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Bob receives the to-device message
     let (to_device_events, _) = receive_to_device_event(&bob, &event, &decryption_settings).await;

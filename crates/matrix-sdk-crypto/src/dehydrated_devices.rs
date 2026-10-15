@@ -249,7 +249,8 @@ impl RehydratedDevice {
     /// let mut since_token = None;
     /// let mut imported_room_keys = 0;
     /// let decryption_settings = DecryptionSettings {
-    ///     sender_device_trust_requirement: TrustRequirement::Untrusted
+    ///     sender_device_trust_requirement: TrustRequirement::Untrusted,
+    ///     refuse_legacy_from_unsigned_known_devices: false,
     /// };
     ///
     /// loop {
@@ -576,8 +577,10 @@ mod tests {
         assert_eq!(rehydrated.rehydrated.device_id(), request.device_id);
         assert_eq!(rehydrated.original.device_id(), alice.device_id());
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         // Push the to-device event containing the room key into the rehydrated device.
         let ret = rehydrated
@@ -691,8 +694,10 @@ mod tests {
         assert_eq!(rehydrated.rehydrated.device_id(), &device_id);
         assert_eq!(rehydrated.original.device_id(), alice.device_id());
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         // Push the to-device event containing the room key into the rehydrated device.
         let ret = rehydrated

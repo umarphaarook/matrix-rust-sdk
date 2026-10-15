@@ -125,7 +125,10 @@ impl TestClientBuilder {
             } else {
                 (TrustRequirement::Untrusted, CollectStrategy::AllDevices)
             };
-        self.decryption_settings = Some(DecryptionSettings { sender_device_trust_requirement });
+        self.decryption_settings = Some(DecryptionSettings {
+            sender_device_trust_requirement,
+            refuse_legacy_from_unsigned_known_devices: false,
+        });
         self.room_key_recipient_strategy = room_key_recipient_strategy;
 
         self

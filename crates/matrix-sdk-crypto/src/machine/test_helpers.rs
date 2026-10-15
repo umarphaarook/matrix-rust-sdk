@@ -330,8 +330,10 @@ pub async fn get_machine_pair_with_setup_sessions_test_helper(
     let event =
         ToDeviceEvent::new(alice.user_id().to_owned(), content.deserialize_as_unchecked().unwrap());
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decrypted = bob
         .store()

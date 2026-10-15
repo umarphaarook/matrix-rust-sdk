@@ -299,8 +299,10 @@ fn test_one_time_key_signing() {
 async fn test_keys_for_upload() {
     let machine = OlmMachine::new(user_id(), alice_device_id()).await;
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let key_counts = BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, 49u8.into())]);
 
@@ -665,8 +667,10 @@ async fn send_room_key_to_device(
     );
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     receiver
         .receive_sync_changes(
@@ -796,8 +800,10 @@ async fn test_megolm_encryption() {
 
     let mut room_keys_received_stream = Box::pin(bob.store().room_keys_received_stream());
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let group_session = bob
         .store()
@@ -845,8 +851,10 @@ async fn test_megolm_encryption() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decryption_result =
         bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
@@ -902,8 +910,10 @@ async fn megolm_encryption_setup_helper(room_id: &RoomId) -> (OlmMachine, OlmMac
         to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let group_session = bob
         .store()
@@ -950,8 +960,10 @@ async fn test_megolm_state_encryption() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decryption_result =
         bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
@@ -998,8 +1010,10 @@ async fn test_megolm_state_encryption_bad_type() {
 
     let bad_type_event = json_convert(&bad_type_event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let bad_type_decryption_result =
         bob.try_decrypt_room_event(&bad_type_event, room_id, &decryption_settings).await.unwrap();
@@ -1040,8 +1054,10 @@ async fn test_megolm_state_encryption_bad_state_key() {
 
     let bad_state_key_event = json_convert(&bad_state_key_event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let bad_state_key_decryption_result = bob
         .try_decrypt_room_event(&bad_state_key_event, room_id, &decryption_settings)
@@ -1084,8 +1100,10 @@ async fn test_megolm_state_encryption_outer_state_key_no_inner() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decryption_result =
         bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
@@ -1124,8 +1142,10 @@ async fn test_megolm_state_encryption_inner_state_key_no_outer() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decryption_result =
         bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
@@ -1177,8 +1197,10 @@ async fn test_withheld_unverified() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     bob.receive_sync_changes(
         EncryptionSyncChanges {
@@ -1228,8 +1250,10 @@ async fn test_withheld_unverified() {
     });
     let room_event = json_convert(&room_event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     let decrypt_result = bob.decrypt_room_event(&room_event, room_id, &decryption_settings).await;
 
     assert_matches!(&decrypt_result, Err(MegolmError::MissingRoomKey(Some(_))));
@@ -1269,8 +1293,10 @@ async fn test_decrypt_unencrypted_event() {
     let event = json_convert(&event).unwrap();
 
     // decrypt_room_event should return an error
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     assert_matches!(
         bob.decrypt_room_event(&event, room_id, &decryption_settings).await,
         Err(MegolmError::JsonError(..))
@@ -1443,8 +1469,10 @@ async fn test_query_ratcheted_key() {
         to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let group_session = bob
         .store()
@@ -1461,8 +1489,10 @@ async fn test_query_ratcheted_key() {
 
     let room_event = json_convert(&room_event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     let decrypt_error =
         bob.decrypt_room_event(&room_event, room_id, &decryption_settings).await.unwrap_err();
 
@@ -1500,8 +1530,10 @@ async fn test_room_key_over_megolm() {
     let changed_devices = DeviceLists::new();
     let key_counts: BTreeMap<_, _> = Default::default();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let _ = bob
         .receive_sync_changes(
@@ -1537,8 +1569,10 @@ async fn test_room_key_over_megolm() {
 
     let event: EncryptedToDeviceEvent = serde_json::from_value(event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let decrypt_result = bob
         .store()
@@ -1554,8 +1588,10 @@ async fn test_room_key_over_megolm() {
 
     let event: Raw<AnyToDeviceEvent> = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     bob.receive_sync_changes(
         EncryptionSyncChanges {
@@ -1609,8 +1645,10 @@ async fn test_room_key_with_fake_identity_keys() {
     });
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     assert_matches!(
         alice.decrypt_room_event(&event, room_id, &decryption_settings).await,
         Err(MegolmError::MismatchedIdentityKeys { .. })
@@ -1855,8 +1893,10 @@ async fn test_unsigned_decryption() {
         to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Save the first room key.
     let group_session = bob
@@ -1893,8 +1933,10 @@ async fn test_unsigned_decryption() {
     let raw_encrypted_event = json_convert(&first_message_encrypted_event).unwrap();
 
     // Bob has the room key, so first message should be decrypted successfully.
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     let raw_decrypted_event =
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
@@ -1974,8 +2016,10 @@ async fn test_unsigned_decryption() {
         })
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Give Bob the second room key.
     let group_session = bob
@@ -2097,8 +2141,10 @@ async fn test_unsigned_decryption() {
         })
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Give Bob the third room key.
     let group_session = bob

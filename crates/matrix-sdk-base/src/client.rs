@@ -222,6 +222,7 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             decryption_settings: DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
             },
             #[cfg(feature = "e2e-encryption")]
             handle_verification_events: true,

@@ -15,6 +15,7 @@
 use std::{iter, sync::Arc};
 
 use assert_matches2::{assert_let, assert_matches};
+use futures_util::{FutureExt, StreamExt};
 use matrix_sdk_common::deserialized_responses::{
     DeviceLinkProblem, ShieldState, VerificationLevel, VerificationState,
 };
@@ -34,12 +35,13 @@ use crate::{
     OlmMachine, OtherUserIdentityData, TrustRequirement, UserIdentity,
     machine::{
         test_helpers::{
+            bootstrap_requests_to_keys_query_response,
             get_machine_pair_with_setup_sessions_test_helper, get_prepared_machine_test_helper,
         },
         tests,
     },
     olm::{InboundGroupSession, OutboundGroupSession, SenderData},
-    store::types::{Changes, IdentityChanges},
+    store::types::{Changes, DeviceChanges, IdentityChanges},
     types::{
         CrossSigningKey, DeviceKeys, EventEncryptionAlgorithm, MasterPubkey, SelfSigningPubkey,
         events::{
@@ -80,8 +82,10 @@ async fn test_decryption_verification_state() {
         tests::to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let group_session = bob
         .store()
@@ -118,8 +122,10 @@ async fn test_decryption_verification_state() {
 
     let event = json_convert(&event).unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
     let encryption_info = bob
         .decrypt_room_event(&event, room_id, &decryption_settings)
         .await
@@ -348,7 +354,10 @@ async fn test_verification_states_spoofed_sender(
     set_up_alice_cross_signing(&alice, &bob).await;
 
     let room_id = room_id!("!test:example.org");
-    let decryption_settings = DecryptionSettings { sender_device_trust_requirement };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Alice sends a message to Bob.
     let (event, _) = encrypt_message(&alice, room_id, &bob, "Secret message").await;
@@ -452,7 +461,7 @@ async fn test_verification_states_multiple_device() {
     )
     .unwrap();
 
-    let (state, _) = bob
+    let (state, _, _) = bob
         .get_room_event_verification_state(&web_unverified_inbound_session, other_user_id)
         .await
         .unwrap();
@@ -471,7 +480,7 @@ async fn test_verification_states_multiple_device() {
     )
     .unwrap();
 
-    let (state, _) = bob
+    let (state, _, _) = bob
         .get_room_event_verification_state(&web_signed_inbound_session, other_user_id)
         .await
         .unwrap();
@@ -584,6 +593,321 @@ async fn test_decryption_trust_with_identity_change() {
         ],
     )
     .await;
+}
+
+/// Set up Bob so that the Megolm session behind the returned event looks like
+/// one he imported (from a key backup, say): flagged as imported, and carrying
+/// the legacy sender data every imported session gets.
+async fn bob_imports_alices_session(
+    alice: &OlmMachine,
+    bob: &OlmMachine,
+    room_id: &RoomId,
+) -> (Raw<EncryptedEvent>, InboundGroupSession) {
+    let (event, session_id) = encrypt_message(alice, room_id, bob, "Secret message").await;
+
+    let mut session =
+        bob.store().get_inbound_group_session(room_id, &session_id).await.unwrap().unwrap();
+    session.mark_as_imported();
+    session.sender_data = SenderData::legacy();
+    bob.store().save_inbound_group_sessions(&[session.clone()]).await.unwrap();
+
+    (event, session)
+}
+
+/// Settings for `CrossSignedOrLegacy` decryption, with the rule that refuses
+/// a legacy session from a known unsigned device switched on or off.
+fn cross_signed_or_legacy(refuse_legacy_from_unsigned_known_devices: bool) -> DecryptionSettings {
+    DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::CrossSignedOrLegacy,
+        refuse_legacy_from_unsigned_known_devices,
+    }
+}
+
+/// Alice's device as it would come in a `/keys/query` response, unsigned.
+async fn alices_unsigned_device_keys_query_response(
+    alice: &OlmMachine,
+) -> ruma::api::client::keys::get_keys::v3::Response {
+    let alice_device = DeviceData::from_machine_test_helper(alice).await.unwrap();
+    ruma_response_from_json(&json!({
+        "device_keys": { alice.user_id(): { alice.device_id(): alice_device.as_device_keys() } }
+    }))
+}
+
+/// A session imported after we already knew the claimed sender's device, and
+/// that device is not signed by its owner: a live session from it would be
+/// refused under `CrossSignedOrLegacy`, so with
+/// `refuse_legacy_from_unsigned_known_devices` the imported copy is too.
+///
+/// Importing can't prove which device made the session, so the refreshed
+/// sender data stays at the legacy default and can't be what decides this.
+#[async_test]
+async fn test_imported_session_from_known_unsigned_device_is_refused() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+
+    // The device is there, and unsigned.
+    let device = bob
+        .store()
+        .get_device_from_curve_key(alice.user_id(), session.sender_key())
+        .await
+        .unwrap()
+        .expect("Bob knows Alice's device");
+    assert!(!device.is_cross_signed_by_owner());
+
+    // Pin what the refresh does with an imported session: it can't attribute it
+    // to the device, so the sender data stays legacy. That is why the trust
+    // check can't just read the refreshed data, and why the device the lookup
+    // found comes back alongside it.
+    let (refreshed, found_device) =
+        bob.get_or_update_sender_data(&session, alice.user_id()).await.unwrap();
+    assert_matches!(
+        refreshed,
+        SenderData::UnknownDevice { legacy_session: true, owner_check_failed: false }
+    );
+    assert_eq!(found_device.expect("the lookup finds the device").device_id(), alice.device_id());
+
+    // Refused for the same reason a live session from the device would be.
+    let settings = cross_signed_or_legacy(true);
+    assert_matches!(
+        bob.decrypt_room_event(&event, room_id, &settings).await,
+        Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
+    );
+
+    // The rule only applies to `CrossSignedOrLegacy`; the other requirements
+    // behave as they always did.
+    for (trust_requirement, is_ok) in
+        [(TrustRequirement::Untrusted, true), (TrustRequirement::CrossSigned, false)]
+    {
+        let settings = DecryptionSettings {
+            sender_device_trust_requirement: trust_requirement,
+            refuse_legacy_from_unsigned_known_devices: true,
+        };
+        assert_eq!(
+            bob.decrypt_room_event(&event, room_id, &settings).await.is_ok(),
+            is_ok,
+            "unexpected result for {trust_requirement:?}",
+        );
+    }
+
+    // And again once a `/keys/query` has told us about the device, which
+    // re-evaluates the sender data of the sessions from it: the imported session
+    // must neither lose its legacy flag nor slip through.
+    bob.receive_keys_query_response(
+        &TransactionId::new(),
+        &alices_unsigned_device_keys_query_response(&alice).await,
+    )
+    .await
+    .unwrap();
+    assert_matches!(
+        bob.decrypt_room_event(&event, room_id, &settings).await,
+        Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
+    );
+}
+
+/// Without `refuse_legacy_from_unsigned_known_devices` a legacy session keeps
+/// the allowance it always had, whatever we know about the sender's device,
+/// before and after a `/keys/query`.
+#[async_test]
+async fn test_imported_session_from_known_unsigned_device_is_decrypted_by_default() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, _session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+
+    check_decryption_trust_requirement(
+        &bob,
+        &event,
+        room_id,
+        &[
+            (TrustRequirement::Untrusted, true),
+            (TrustRequirement::CrossSignedOrLegacy, true),
+            (TrustRequirement::CrossSigned, false),
+        ],
+    )
+    .await;
+
+    bob.receive_keys_query_response(
+        &TransactionId::new(),
+        &alices_unsigned_device_keys_query_response(&alice).await,
+    )
+    .await
+    .unwrap();
+
+    check_decryption_trust_requirement(
+        &bob,
+        &event,
+        room_id,
+        &[(TrustRequirement::CrossSignedOrLegacy, true)],
+    )
+    .await;
+}
+
+/// A session imported from a device we know nothing about keeps the legacy
+/// allowance: only a positive match against an unsigned device refuses.
+#[async_test]
+async fn test_imported_session_from_unknown_device_is_still_decrypted() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+
+    // Bob no longer knows the device (it was deleted, or never uploaded).
+    let device = bob
+        .store()
+        .get_device_data(alice.user_id(), alice.device_id())
+        .await
+        .unwrap()
+        .expect("Bob knows Alice's device");
+    bob.store()
+        .save_changes(Changes {
+            devices: DeviceChanges { deleted: vec![device], ..Default::default() },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        bob.store()
+            .get_device_from_curve_key(alice.user_id(), session.sender_key())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let settings = cross_signed_or_legacy(true);
+    assert!(bob.decrypt_room_event(&event, room_id, &settings).await.is_ok());
+}
+
+/// A session imported from a device that is cross-signed by its owner is
+/// decrypted, as it always was.
+#[async_test]
+async fn test_imported_session_from_cross_signed_device_is_decrypted() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+
+    bob.bootstrap_cross_signing(false).await.unwrap();
+    set_up_alice_cross_signing(&alice, &bob).await;
+
+    let device = bob
+        .store()
+        .get_device_from_curve_key(alice.user_id(), session.sender_key())
+        .await
+        .unwrap()
+        .expect("Bob knows Alice's device");
+    assert!(device.is_cross_signed_by_owner());
+
+    // The imported session carries no proof of its sender, so only the
+    // legacy-tolerant requirement lets it through, as before.
+    let settings = cross_signed_or_legacy(true);
+    assert!(bob.decrypt_room_event(&event, room_id, &settings).await.is_ok());
+    assert!(
+        bob.decrypt_room_event(
+            &event,
+            room_id,
+            &DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::CrossSigned,
+                refuse_legacy_from_unsigned_known_devices: true,
+            },
+        )
+        .await
+        .is_err()
+    );
+}
+
+/// The refusal is not sticky: when the device then becomes cross-signed by its
+/// owner, as told by a `/keys/query` response (not by poking the store), the
+/// imported session decrypts.
+#[async_test]
+async fn test_imported_session_decrypts_once_the_device_is_cross_signed_by_keys_query() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, _session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+    let settings = cross_signed_or_legacy(true);
+
+    assert_matches!(
+        bob.decrypt_room_event(&event, room_id, &settings).await,
+        Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
+    );
+
+    // Alice cross-signs her device, and Bob finds out through `/keys/query`.
+    let bootstrap_requests = alice.bootstrap_cross_signing(false).await.unwrap();
+    bob.receive_keys_query_response(
+        &TransactionId::new(),
+        &bootstrap_requests_to_keys_query_response(bootstrap_requests),
+    )
+    .await
+    .unwrap();
+
+    assert!(bob.decrypt_room_event(&event, room_id, &settings).await.is_ok());
+}
+
+/// A session imported while its device was known and unsigned is refused;
+/// when the device later gets signed, the update reaches the room key stream
+/// (that is what makes the client retry the events it could not decrypt), and
+/// retrying then succeeds.
+#[async_test]
+async fn test_imported_session_is_announced_and_decrypts_once_the_device_is_signed() {
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session) = bob_imports_alices_session(&alice, &bob, room_id).await;
+    let settings = cross_signed_or_legacy(true);
+
+    assert_matches!(
+        bob.decrypt_room_event(&event, room_id, &settings).await,
+        Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
+    );
+
+    let mut room_keys_received_stream = Box::pin(bob.store().room_keys_received_stream());
+
+    let bootstrap_requests = alice.bootstrap_cross_signing(false).await.unwrap();
+    bob.receive_keys_query_response(
+        &TransactionId::new(),
+        &bootstrap_requests_to_keys_query_response(bootstrap_requests),
+    )
+    .await
+    .unwrap();
+
+    let room_key_infos = room_keys_received_stream
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("the room key stream should announce the sessions of the changed device")
+        .unwrap();
+    assert!(
+        room_key_infos.iter().any(|info| info.session_id == session.session_id()),
+        "the imported session should have been announced, got {room_key_infos:?}",
+    );
+
+    assert!(bob.decrypt_room_event(&event, room_id, &settings).await.is_ok());
 }
 
 /// A session imported from backup is a legacy session, so it should stay
@@ -700,8 +1024,10 @@ async fn encrypt_message(
         tests::to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let group_session = recipient
         .store()
@@ -750,8 +1076,10 @@ async fn check_decryption_trust_requirement(
     tests: &[(TrustRequirement, bool)],
 ) {
     for (trust_requirement, is_ok) in tests {
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: *trust_requirement };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: *trust_requirement,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
         if *is_ok {
             assert!(
                 bob.decrypt_room_event(event, room_id, &decryption_settings).await.is_ok(),

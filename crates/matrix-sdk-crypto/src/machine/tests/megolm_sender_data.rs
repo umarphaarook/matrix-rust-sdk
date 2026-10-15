@@ -64,8 +64,10 @@ async fn test_receive_megolm_session_from_unknown_device() {
     let room_id = room_id!("!test:example.org");
     let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Bob receives the to-device message
     receive_to_device_event(&bob, &event, &decryption_settings).await;
@@ -93,8 +95,10 @@ async fn test_receive_megolm_session_with_bad_device_keys() {
     let (alice, bob) = get_machine_pair().await;
 
     let room_id = room_id!("!test:example.org");
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let alice_account = alice.store().load_account().await.unwrap().unwrap();
     let alice_device_keys = alice_account.device_keys();
@@ -210,8 +214,10 @@ async fn test_receive_megolm_session_from_known_device() {
         ),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Bob receives the to-device message
     receive_to_device_event(&bob, &event, &decryption_settings).await;
@@ -247,8 +253,10 @@ async fn test_update_unknown_device_senderdata_on_keys_query() {
     let room_id = room_id!("!test:example.org");
     let event = create_and_share_session_with_custom_sender_data(&alice, &bob, room_id, None).await;
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Bob receives the to-device message
     receive_to_device_event(&bob, &event, &decryption_settings).await;
@@ -308,8 +316,10 @@ async fn test_update_device_info_senderdata_on_keys_query() {
         to_device_requests_to_content(to_device_requests),
     );
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // Bob receives the to-device message
     receive_to_device_event(&bob, &event, &decryption_settings).await;

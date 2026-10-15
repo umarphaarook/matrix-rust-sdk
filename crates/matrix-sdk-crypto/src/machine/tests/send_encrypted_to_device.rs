@@ -64,8 +64,10 @@ async fn test_send_encrypted_to_device() {
             "rooms": ["!726s6s6q:example.com"]
     });
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -134,8 +136,10 @@ async fn test_encrypted_to_device_from_deleted_device() {
     let custom_event_type = "m.new_device";
     let custom_content = json!({"a": "b"});
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -178,8 +182,10 @@ async fn test_receive_custom_encrypted_to_device_with_no_sender_device_keys_fail
             "rooms": ["!726s6s6q:example.com"]
     });
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     // We need to suppress the sender_data field to correctly emulate an unknown
     // device
@@ -209,6 +215,7 @@ async fn test_excluding_insecure_means_custom_to_device_events_from_unverified_d
     // Given we are in "exclude insecure devices" mode
     let decryption_settings = DecryptionSettings {
         sender_device_trust_requirement: TrustRequirement::CrossSignedOrLegacy,
+        refuse_legacy_from_unsigned_known_devices: false,
     };
 
     // Bob is the receiver
@@ -262,6 +269,7 @@ async fn test_excluding_insecure_does_not_prevent_key_events_being_processed() {
     // Given we are in "exclude insecure devices" mode
     let decryption_settings = DecryptionSettings {
         sender_device_trust_requirement: TrustRequirement::CrossSignedOrLegacy,
+        refuse_legacy_from_unsigned_known_devices: false,
     };
 
     // Bob is the receiver
@@ -324,8 +332,10 @@ async fn test_send_olm_encryption_info_unverified_identity() {
             "rooms": ["!726s6s6q:example.com"]
     });
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -368,8 +378,10 @@ async fn test_send_olm_encryption_info_verified_identity() {
             "rooms": ["!726s6s6q:example.com"]
     });
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -408,8 +420,10 @@ async fn test_send_olm_encryption_info_verified_locally() {
         .await
         .unwrap();
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -454,8 +468,10 @@ async fn test_send_olm_encryption_info_verification_violation() {
             "rooms": ["!726s6s6q:example.com"]
     });
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let processed_event = send_and_receive_encrypted_to_device_test_helper(
         &alice,
@@ -579,8 +595,10 @@ async fn test_processed_to_device_variants() {
         next_batch_token: None,
     };
 
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let decryption_settings = DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+        refuse_legacy_from_unsigned_known_devices: false,
+    };
 
     let (processed, _) =
         bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();

@@ -174,6 +174,7 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             decryption_settings: DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
             },
             #[cfg(feature = "e2e-encryption")]
             enable_share_history_on_invite: true,
@@ -1270,6 +1271,7 @@ pub(crate) mod tests {
             .server_name_or_homeserver_url(homeserver.uri())
             .with_decryption_settings(DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::CrossSigned,
+                refuse_legacy_from_unsigned_known_devices: false,
             });
 
         let client = builder.build().await.unwrap();
@@ -1288,6 +1290,7 @@ pub(crate) mod tests {
             .server_name_or_homeserver_url(homeserver.uri())
             .with_decryption_settings(DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
             });
 
         let client = builder.build().await.unwrap();

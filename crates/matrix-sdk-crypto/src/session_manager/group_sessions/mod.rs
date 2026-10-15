@@ -1707,8 +1707,10 @@ mod tests {
                 next_batch_token: None,
             };
 
-            let decryption_settings =
-                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+            let decryption_settings = DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
+            };
 
             let (decrypted, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
@@ -1777,8 +1779,10 @@ mod tests {
                 next_batch_token: None,
             };
 
-            let decryption_settings =
-                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+            let decryption_settings = DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+                refuse_legacy_from_unsigned_known_devices: false,
+            };
 
             let (decrypted, _) =
                 machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
@@ -1880,8 +1884,10 @@ mod tests {
             next_batch_token: None,
         };
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         let (decrypted, _) =
             bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();

@@ -33,7 +33,7 @@ async fn main() -> Result<(), OlmError> {
     let next_batch_token = "T0K3N".to_owned();
 
     let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted, refuse_legacy_from_unsigned_known_devices: false };
 
     // Push changes that the server sent to us in a sync response.
     let decrypted_to_device = machine

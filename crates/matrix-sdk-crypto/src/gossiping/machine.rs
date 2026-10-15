@@ -1886,6 +1886,7 @@ mod tests {
                         &event,
                         &DecryptionSettings {
                             sender_device_trust_requirement: TrustRequirement::Untrusted,
+                            refuse_legacy_from_unsigned_known_devices: false,
                         },
                     )
                     .await?;
@@ -1975,6 +1976,7 @@ mod tests {
                         &event,
                         &DecryptionSettings {
                             sender_device_trust_requirement: TrustRequirement::Untrusted,
+                            refuse_legacy_from_unsigned_known_devices: false,
                         },
                     )
                     .await?;
@@ -2191,8 +2193,10 @@ mod tests {
         let stream = bob_machine.store().secrets_stream();
         pin_mut!(stream);
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         bob_machine
             .receive_sync_changes(
@@ -2312,6 +2316,7 @@ mod tests {
                         &event,
                         &DecryptionSettings {
                             sender_device_trust_requirement: TrustRequirement::Untrusted,
+                            refuse_legacy_from_unsigned_known_devices: false,
                         },
                     )
                     .await?;
@@ -2482,8 +2487,10 @@ mod tests {
         let stream = bob_machine.store().secrets_stream();
         pin_mut!(stream);
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         bob_machine
             .receive_sync_changes(
@@ -2555,8 +2562,10 @@ mod tests {
         let stream = bob_machine.store().secrets_stream();
         pin_mut!(stream);
 
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
 
         bob_machine
             .receive_sync_changes(

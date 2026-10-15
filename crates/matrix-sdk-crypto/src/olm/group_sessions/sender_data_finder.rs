@@ -153,12 +153,18 @@ impl<'a> SenderDataFinder<'a> {
 
     /// Find the device using the curve key provided, and decide whether we
     /// trust the sender.
+    ///
+    /// Also returns the device that matched the curve key, if we know one,
+    /// whether or not it owns the session: callers that need to know about
+    /// the device (for instance an imported session never passes the
+    /// ownership check, yet its sender key still names a device) can then
+    /// avoid looking it up a second time.
     pub(crate) async fn find_using_curve_key(
         store: &'a Store,
         sender_curve_key: Curve25519PublicKey,
         sender_user_id: &'a UserId,
         session: &'a InboundGroupSession,
-    ) -> Result<SenderData, SessionDeviceCheckError> {
+    ) -> Result<(SenderData, Option<Device>), SessionDeviceCheckError> {
         let finder = Self { store, session };
         finder.search_for_device(sender_curve_key, sender_user_id).await
     }
@@ -181,7 +187,9 @@ impl<'a> SenderDataFinder<'a> {
             Ok(self.have_device_data(sender_device_data).await?)
         } else {
             // No: look for the device in the store
-            Ok(self.search_for_device(sender_curve_key, &room_key_event.sender).await?)
+            let (sender_data, _) =
+                self.search_for_device(sender_curve_key, &room_key_event.sender).await?;
+            Ok(sender_data)
         }
     }
 
@@ -190,14 +198,15 @@ impl<'a> SenderDataFinder<'a> {
         &self,
         sender_curve_key: Curve25519PublicKey,
         sender_user_id: &UserId,
-    ) -> Result<SenderData, SessionDeviceCheckError> {
+    ) -> Result<(SenderData, Option<Device>), SessionDeviceCheckError> {
         // Does the locally-cached (in the store) devices list contain a device with the
         // curve key of the sender of the to-device message?
         if let Some(sender_device) =
             self.store.get_device_from_curve_key(sender_user_id, sender_curve_key).await?
         {
             // Yes: use the device to continue
-            self.have_device(sender_device)
+            let sender_data = self.have_device(&sender_device)?;
+            Ok((sender_data, Some(sender_device)))
         } else {
             // Step C (we don't know the sending device)
             //
@@ -209,7 +218,7 @@ impl<'a> SenderDataFinder<'a> {
                 legacy_session: false,
                 owner_check_failed: false,
             };
-            Ok(sender_data)
+            Ok((sender_data, None))
         }
     }
 
@@ -218,13 +227,13 @@ impl<'a> SenderDataFinder<'a> {
         sender_device_data: DeviceData,
     ) -> Result<SenderData, SessionDeviceCheckError> {
         let sender_device = self.store.wrap_device_data(sender_device_data).await?;
-        self.have_device(sender_device)
+        self.have_device(&sender_device)
     }
 
     /// Step D (we have a device)
     ///
     /// Returns Err if the device does not own the session.
-    fn have_device(&self, sender_device: Device) -> Result<SenderData, SessionDeviceCheckError> {
+    fn have_device(&self, sender_device: &Device) -> Result<SenderData, SessionDeviceCheckError> {
         // Is the session owned by the device?
         let device_is_owner = sender_device.is_owner_of_session(self.session)?;
 
@@ -235,7 +244,7 @@ impl<'a> SenderDataFinder<'a> {
         } else {
             // Steps F, G, and H: we have a device, which may or may not be signed by the
             // sender.
-            Ok(SenderData::from_device(&sender_device))
+            Ok(SenderData::from_device(sender_device))
         }
     }
 }

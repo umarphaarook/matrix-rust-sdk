@@ -2042,6 +2042,10 @@ impl OlmMachine {
     /// Stores the updated [`SenderData`] for the session in the store
     /// if we find an updated value for it.
     ///
+    /// The last element of the result is the device of `sender` whose
+    /// curve25519 key is the sender key of the session, if we know of one
+    /// (see `OlmMachine::get_or_update_sender_data`).
+    ///
     /// # Arguments
     ///
     /// * `session` - The inbound Megolm session that was used to decrypt the
@@ -2052,8 +2056,8 @@ impl OlmMachine {
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-    ) -> MegolmResult<(VerificationState, Option<OwnedDeviceId>)> {
-        let sender_data = self.get_or_update_sender_data(session, sender).await?;
+    ) -> MegolmResult<(VerificationState, Option<OwnedDeviceId>, Option<Device>)> {
+        let (sender_data, known_device) = self.get_or_update_sender_data(session, sender).await?;
 
         // If the user ID in the sender data doesn't match that in the event envelope,
         // this event is not from who it appears to be from.
@@ -2073,7 +2077,7 @@ impl OlmMachine {
             }
         };
 
-        Ok((verification_state, device_id))
+        Ok((verification_state, device_id, known_device))
     }
 
     /// Get an up-to-date [`SenderData`] for the given session, suitable for
@@ -2086,6 +2090,12 @@ impl OlmMachine {
     /// Stores the updated [`SenderData`] for the session in the store
     /// if we find an updated value for it.
     ///
+    /// Also returns the device of `sender` whose curve25519 key is the sender
+    /// key of the session, if we know of one, whether or not it is the owner
+    /// of the session (an imported session never is). Only a session whose
+    /// sender data [should be recalculated](SenderData::should_recalculate)
+    /// goes looking for it; that is every session that can be a legacy one.
+    ///
     /// # Arguments
     ///
     /// * `session` - The Megolm session that was used to decrypt the event.
@@ -2094,8 +2104,8 @@ impl OlmMachine {
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-    ) -> MegolmResult<SenderData> {
-        let sender_data = if session.sender_data.should_recalculate() {
+    ) -> MegolmResult<(SenderData, Option<Device>)> {
+        let (sender_data, known_device) = if session.sender_data.should_recalculate() {
             // The session is not sure of the sender yet. Try to find a matching device
             // belonging to the claimed sender of the recently-received event.
             //
@@ -2114,7 +2124,7 @@ impl OlmMachine {
             // the session belongs to Alice, but then we do a device lookup for
             // Bob, we find a matching device with a cross-signature, so prefer
             // that.
-            let calculated_sender_data = SenderDataFinder::find_using_curve_key(
+            let (calculated_sender_data, known_device) = SenderDataFinder::find_using_curve_key(
                 self.store(),
                 session.sender_key(),
                 sender,
@@ -2130,16 +2140,16 @@ impl OlmMachine {
                 self.store().save_inbound_group_sessions(&[new_session]).await?;
 
                 // and use it now.
-                calculated_sender_data
+                (calculated_sender_data, known_device)
             } else {
                 // No - use the existing data.
-                session.sender_data.clone()
+                (session.sender_data.clone(), known_device)
             }
         } else {
-            session.sender_data.clone()
+            (session.sender_data.clone(), None)
         };
 
-        Ok(sender_data)
+        Ok((sender_data, known_device))
     }
 
     /// Request missing local secrets from our devices (cross signing private
@@ -2225,11 +2235,11 @@ impl OlmMachine {
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-    ) -> MegolmResult<Arc<EncryptionInfo>> {
-        let (verification_state, device_id) =
+    ) -> MegolmResult<(Arc<EncryptionInfo>, Option<Device>)> {
+        let (verification_state, device_id, known_device) =
             self.get_room_event_verification_state(session, sender).await?;
 
-        Ok(Arc::new(EncryptionInfo {
+        let encryption_info = Arc::new(EncryptionInfo {
             sender: sender.to_owned(),
             sender_device: device_id,
             forwarder: session.forwarder_data.as_ref().and_then(|data| {
@@ -2251,7 +2261,9 @@ impl OlmMachine {
                 session_id: Some(session.session_id().to_owned()),
             },
             verification_state,
-        }))
+        });
+
+        Ok((encryption_info, known_device))
     }
 
     async fn decrypt_megolm_events(
@@ -2274,12 +2286,14 @@ impl OlmMachine {
         let result = session.decrypt(event).await;
         match result {
             Ok((decrypted_event, _)) => {
-                let encryption_info = self.get_encryption_info(&session, &event.sender).await?;
+                let (encryption_info, known_device) =
+                    self.get_encryption_info(&session, &event.sender).await?;
 
                 self.check_sender_trust_requirement(
                     &session,
                     &encryption_info,
-                    &decryption_settings.sender_device_trust_requirement,
+                    known_device.as_ref(),
+                    decryption_settings,
                 )?;
 
                 Ok((decrypted_event, encryption_info))
@@ -2311,12 +2325,19 @@ impl OlmMachine {
     ///
     /// If the requirement is not satisfied, returns
     /// [`MegolmError::SenderIdentityNotTrusted`].
+    ///
+    /// `known_sender_device` is the device of the claimed sender that matches
+    /// the sender key of the session, if we know one (see
+    /// `OlmMachine::get_or_update_sender_data`).
     fn check_sender_trust_requirement(
         &self,
         session: &InboundGroupSession,
         encryption_info: &EncryptionInfo,
-        trust_requirement: &TrustRequirement,
+        known_sender_device: Option<&Device>,
+        decryption_settings: &DecryptionSettings,
     ) -> MegolmResult<()> {
+        let trust_requirement = &decryption_settings.sender_device_trust_requirement;
+
         trace!(
             verification_state = ?encryption_info.verification_state,
             ?trust_requirement, "check_sender_trust_requirement",
@@ -2353,15 +2374,34 @@ impl OlmMachine {
                 // 3. If we have no information about the device, we should only decrypt if it's
                 //    a legacy session.
                 // 4. Anything else, should throw an error.
+                //
+                // Cases 2 and 3 are a concession to sessions that predate our
+                // collection of sender data. With
+                // `refuse_legacy_from_unsigned_known_devices` they stop short of
+                // letting through a message that a live session from the same
+                // device would have been refused, which is what a legacy session
+                // can be when it was imported (for instance from a key backup)
+                // while the device was known to us and unsigned.
                 match (verification_level, legacy_session) {
                     // Case 1
                     (VerificationLevel::UnverifiedIdentity, _) => true,
 
-                    // Case 2
-                    (VerificationLevel::UnsignedDevice, true) => true,
+                    // Cases 2 and 3
+                    (VerificationLevel::UnsignedDevice | VerificationLevel::None(_), true) => {
+                        if decryption_settings.refuse_legacy_from_unsigned_known_devices
+                            && known_sender_device
+                                .is_some_and(|device| !device.is_cross_signed_by_owner())
+                        {
+                            // Report what a live session from this device would have
+                            // reported, rather than the (weaker) level we derived from
+                            // the legacy sender data.
+                            return Err(MegolmError::SenderIdentityNotTrusted(
+                                VerificationLevel::UnsignedDevice,
+                            ));
+                        }
 
-                    // Case 3
-                    (VerificationLevel::None(_), true) => true,
+                        true
+                    }
 
                     // Case 4
                     (VerificationLevel::VerificationViolation, _)
@@ -2785,7 +2825,7 @@ impl OlmMachine {
         sender: &UserId,
     ) -> MegolmResult<Arc<EncryptionInfo>> {
         let session = self.get_inbound_group_session_or_error(room_id, session_id).await?;
-        self.get_encryption_info(&session, sender).await
+        self.get_encryption_info(&session, sender).await.map(|(encryption_info, _)| encryption_info)
     }
 
     /// Update the list of tracked users.

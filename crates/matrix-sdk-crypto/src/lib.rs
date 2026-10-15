@@ -152,6 +152,28 @@ pub struct DecryptionSettings {
     /// event. If the sender's device is not sufficiently trusted,
     /// [`MegolmError::SenderIdentityNotTrusted`] will be returned.
     pub sender_device_trust_requirement: TrustRequirement,
+
+    /// Only meaningful with [`TrustRequirement::CrossSignedOrLegacy`].
+    ///
+    /// When `true`, a legacy session (for instance one imported from a key
+    /// backup) is refused with [`MegolmError::SenderIdentityNotTrusted`] if its
+    /// sender curve25519 key belongs to a device of the claimed sender that we
+    /// currently know and that is not cross-signed by its owner. Without this,
+    /// restoring a backup decrypts, on a new device, messages that the device
+    /// that received the live session refused for exactly that reason.
+    ///
+    /// This is a best-effort rule for the honest-device case. It cannot tell
+    /// who really created an imported session, so a malicious homeserver can
+    /// still feed us a device list that hides the device; it needs the device
+    /// to be known (and so is order dependent when a decryption result was
+    /// already cached before the device was known). The real fix is
+    /// authenticated sender data in the backup (MSC4048).
+    ///
+    /// It only ever refuses, never raises the trust of a session, and a
+    /// refused session decrypts again once the device is cross-signed by its
+    /// owner. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refuse_legacy_from_unsigned_known_devices: bool,
 }
 
 /// The result of an attempt to decrypt a room event: either a successful
@@ -631,7 +653,8 @@ pub enum RoomEventDecryptionResult {
 ///     };
 ///
 ///     let decryption_settings = DecryptionSettings {
-///         sender_device_trust_requirement: TrustRequirement::Untrusted
+///         sender_device_trust_requirement: TrustRequirement::Untrusted,
+///         refuse_legacy_from_unsigned_known_devices: false,
 ///     };
 ///
 ///     // Push the sync changes into the OlmMachine, make sure that this is
@@ -682,7 +705,7 @@ pub enum RoomEventDecryptionResult {
 /// # let encrypted = unimplemented!();
 /// # let room_id = unimplemented!();
 /// # let machine: OlmMachine = unimplemented!();
-/// # let settings = DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+/// # let settings = DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted, refuse_legacy_from_unsigned_known_devices: false };
 /// // Decrypt your room events now.
 /// let decrypted = machine
 ///     .decrypt_room_event(encrypted, room_id, &settings)
@@ -825,7 +848,8 @@ pub enum RoomEventDecryptionResult {
 ///     };
 ///
 ///     let decryption_settings = DecryptionSettings {
-///         sender_device_trust_requirement: TrustRequirement::Untrusted
+///         sender_device_trust_requirement: TrustRequirement::Untrusted,
+///         refuse_legacy_from_unsigned_known_devices: false,
 ///     };
 ///
 ///     // Push the sync changes into the OlmMachine, make sure that this is
@@ -993,7 +1017,7 @@ pub enum RoomEventDecryptionResult {
 /// # let room_id = unimplemented!();
 /// # let event = unimplemented!();
 /// # let machine: OlmMachine = unimplemented!();
-/// # let settings = DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+/// # let settings = DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted, refuse_legacy_from_unsigned_known_devices: false };
 /// let content = AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain("It's a secret to everybody."));
 /// let encrypted_content = machine.encrypt_room_event(room_id, content).await?;
 /// # Ok(())
@@ -1137,6 +1161,7 @@ mod test {
     fn snapshot_decryption_settings() {
         assert_json_snapshot!(DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
         });
     }
 }
