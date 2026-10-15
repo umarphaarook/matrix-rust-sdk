@@ -1,0 +1,1 @@
+Add `Encryption::get_device`, which looks a device up in the local crypto store and returns a `UserDevice` carrying, among others, `is_cross_signed_by_owner`: whether the device is signed by the cross-signing identity of its owner, as checked by the crypto layer.

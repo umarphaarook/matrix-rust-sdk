@@ -21,7 +21,7 @@ use matrix_sdk_base::crypto::{
     types::{BackupSecrets, RoomKeyBackupInfo},
 };
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
-use ruma::OwnedUserId;
+use ruma::{OwnedDeviceId, OwnedUserId, UserId};
 use serde::de::Error;
 use thiserror::Error;
 use tracing::{error, info};
@@ -582,6 +582,27 @@ fn decode_pickle_key(base64: &str) -> Result<DehydratedDeviceKey, DehydratedDevi
     DehydratedDeviceKey::from_slice(&bytes).map_err(|_| DehydratedDeviceError::InvalidPickleKey)
 }
 
+/// What we know, locally, about one device of a user.
+#[derive(uniffi::Record)]
+pub struct UserDevice {
+    /// The ID of the user the device belongs to.
+    pub user_id: String,
+
+    /// The ID of the device.
+    pub device_id: String,
+
+    /// The display name the user gave the device, if any.
+    pub display_name: Option<String>,
+
+    /// Is the device signed by the cross-signing identity of its owner?
+    ///
+    /// This is the crypto layer's own check of the signature chain, not the
+    /// server's say-so: it is `true` only when the owner's self-signing key,
+    /// as we currently know it, has a valid signature over the device keys.
+    /// It says nothing about whether *we* trust that owner.
+    pub is_cross_signed_by_owner: bool,
+}
+
 #[matrix_sdk_ffi_macros::export]
 impl Encryption {
     /// Get the public ed25519 key of our own device. This is usually what is
@@ -660,6 +681,26 @@ impl Encryption {
     /// identity, and must not be a dehydrated device.
     pub async fn has_devices_to_verify_against(&self) -> Result<bool, ClientError> {
         Ok(self.inner.has_devices_to_verify_against().await?)
+    }
+
+    /// Look a device up in the local crypto store.
+    ///
+    /// Returns `None` when the device is unknown to us, which includes the
+    /// case where the keys of its owner have not been downloaded yet.
+    pub async fn get_device(
+        &self,
+        user_id: String,
+        device_id: String,
+    ) -> Result<Option<UserDevice>, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let device_id = OwnedDeviceId::from(device_id);
+
+        Ok(self.inner.get_device(&user_id, &device_id).await?.map(|device| UserDevice {
+            user_id: device.user_id().to_string(),
+            device_id: device.device_id().to_string(),
+            display_name: device.display_name().map(str::to_owned),
+            is_cross_signed_by_owner: device.is_cross_signed_by_owner(),
+        }))
     }
 
     pub async fn wait_for_backup_upload_steady_state(
@@ -1112,5 +1153,95 @@ pub struct OAuthCrossSigningResetInfo {
 impl From<&matrix_sdk::encryption::OAuthCrossSigningResetInfo> for OAuthCrossSigningResetInfo {
     fn from(value: &matrix_sdk::encryption::OAuthCrossSigningResetInfo) -> Self {
         Self { approval_url: value.approval_url.to_string() }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use std::sync::Arc;
+
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+    use serde_json::json;
+    use wiremock::ResponseTemplate;
+
+    use crate::client::Client;
+
+    /// `get_device` reports whether a device is cross-signed by its owner, and
+    /// `None` for a device we don't know.
+    #[tokio::test]
+    async fn get_device_reports_cross_signing_of_the_owner() {
+        let server = MatrixMockServer::new().await;
+        let sdk_client = server
+            .client_builder()
+            .on_builder(|b| b.cross_process_store_config(CrossProcessLockConfig::SingleProcess))
+            .build()
+            .await;
+        let user_id = sdk_client.user_id().unwrap().to_string();
+        let device_id = sdk_client.device_id().unwrap().to_string();
+        server.mock_upload_keys().ok().mount().await;
+
+        let client = Arc::new(Client::new(sdk_client.clone(), None, None).await.unwrap());
+        let encryption = client.encryption();
+
+        // A device we know nothing about.
+        assert!(
+            encryption.get_device(user_id.clone(), "UNKNOWN".to_owned()).await.unwrap().is_none()
+        );
+
+        // Our own device exists but nobody has signed it yet.
+        let device = encryption
+            .get_device(user_id.clone(), device_id.clone())
+            .await
+            .unwrap()
+            .expect("our own device is always in the store");
+        assert_eq!(device.user_id, user_id);
+        assert_eq!(device.device_id, device_id);
+        assert!(!device.is_cross_signed_by_owner);
+
+        // Bootstrap cross-signing: the new identity signs our own device. The crypto
+        // layer only learns of that signature the way it does in production, from the
+        // server's `/keys/query` answer, so play the homeserver and feed back what we
+        // uploaded.
+        server.mock_upload_cross_signing_keys().ok().mount().await;
+        server.mock_upload_cross_signing_signatures().ok().mount().await;
+        sdk_client.encryption().bootstrap_cross_signing(None).await.unwrap();
+
+        let uploads = server.server().received_requests().await.unwrap();
+        let body_of = |path_suffix: &str| -> serde_json::Value {
+            let request = uploads
+                .iter()
+                .rev()
+                .find(|request| request.url.path().ends_with(path_suffix))
+                .unwrap_or_else(|| panic!("no request to {path_suffix}"));
+            serde_json::from_slice(&request.body).unwrap()
+        };
+        let signing_keys = body_of("keys/device_signing/upload");
+        let signatures = body_of("keys/signatures/upload");
+        let mut device_keys = body_of("keys/upload")["device_keys"].clone();
+        for (user, user_signatures) in
+            signatures[&user_id][&device_id]["signatures"].as_object().unwrap()
+        {
+            for (key_id, signature) in user_signatures.as_object().unwrap() {
+                device_keys["signatures"][user][key_id] = signature.clone();
+            }
+        }
+        server
+            .mock_query_keys()
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_keys": { user_id.clone(): { device_id.clone(): device_keys } },
+                "master_keys": { user_id.clone(): signing_keys["master_key"] },
+                "self_signing_keys": { user_id.clone(): signing_keys["self_signing_key"] },
+                "user_signing_keys": { user_id.clone(): signing_keys["user_signing_key"] },
+            })))
+            .mount()
+            .await;
+        sdk_client.encryption().request_user_identity(sdk_client.user_id().unwrap()).await.unwrap();
+
+        let device = encryption.get_device(user_id, device_id).await.unwrap().unwrap();
+        assert!(device.is_cross_signed_by_owner);
+
+        // A malformed user ID is an error, not a silent `None`.
+        assert!(encryption.get_device("not a user id".to_owned(), "X".to_owned()).await.is_err());
     }
 }
