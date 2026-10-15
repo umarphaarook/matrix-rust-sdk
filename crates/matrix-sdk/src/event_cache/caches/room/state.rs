@@ -877,20 +877,24 @@ mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
         RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
-        latest_event::LatestEventValue,
-        sync::{JoinedRoomUpdate, Timeline},
+        latest_event::LatestEventValue, sync::Timeline,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
         event_id,
-        events::{
-            AnySyncEphemeralRoomEvent,
-            receipt::{ReceiptThread, ReceiptType},
-        },
+        events::receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
         room_id, user_id,
     };
 
-    use crate::test_utils::logged_in_client;
+    use crate::{
+        event_cache::caches::read_receipts::MaybeReceiptEventContent, test_utils::logged_in_client,
+    };
+
+    /// The receipts a sync would hand the room cache, from the content of a
+    /// `m.receipt` event.
+    fn receipts(content: ReceiptEventContent) -> MaybeReceiptEventContent {
+        content.0.into_iter().collect()
+    }
 
     #[async_test]
     async fn test_save_event() {
@@ -940,14 +944,17 @@ mod tests {
         let latest_event_id = event_id!("$1");
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                timeline: Timeline {
+            .handle_joined_room_update(
+                Timeline {
                     limited: false,
                     prev_batch: None,
                     events: vec![f.text_msg("hello").event_id(latest_event_id).into_event()],
                 },
-                ..Default::default()
-            })
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -965,17 +972,20 @@ mod tests {
 
         // A peer's receipt targeting the latest event arrives alone. It changes no
         // unread count of ours, but observers must still hear about it.
-        let receipt = f
-            .read_receipts()
-            .add(latest_event_id, peer, ReceiptType::Read, ReceiptThread::Unthreaded)
-            .into_event()
-            .into_raw::<AnySyncEphemeralRoomEvent>();
+        let receipt = receipts(
+            f.read_receipts()
+                .add(latest_event_id, peer, ReceiptType::Read, ReceiptThread::Unthreaded)
+                .into_content(),
+        );
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                ephemeral: vec![receipt],
-                ..Default::default()
-            })
+            .handle_joined_room_update(
+                Timeline::default(),
+                receipt,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -990,17 +1000,20 @@ mod tests {
 
         // A peer's receipt targeting an OLDER event cannot change what a room
         // list shows for the latest event: no notification.
-        let stale_receipt = f
-            .read_receipts()
-            .add(event_id!("$0"), peer, ReceiptType::Read, ReceiptThread::Unthreaded)
-            .into_event()
-            .into_raw::<AnySyncEphemeralRoomEvent>();
+        let stale_receipt = receipts(
+            f.read_receipts()
+                .add(event_id!("$0"), peer, ReceiptType::Read, ReceiptThread::Unthreaded)
+                .into_content(),
+        );
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                ephemeral: vec![stale_receipt],
-                ..Default::default()
-            })
+            .handle_joined_room_update(
+                Timeline::default(),
+                stale_receipt,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1009,17 +1022,20 @@ mod tests {
         // Our own receipt on the latest event, when nothing it tracks changes,
         // must not re-notify either: only another user's receipt can change the
         // latest event's read state as seen by others.
-        let own_receipt = f
-            .read_receipts()
-            .add(latest_event_id, own_user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
-            .into_event()
-            .into_raw::<AnySyncEphemeralRoomEvent>();
+        let own_receipt = receipts(
+            f.read_receipts()
+                .add(latest_event_id, own_user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+                .into_content(),
+        );
 
         room_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate {
-                ephemeral: vec![own_receipt],
-                ..Default::default()
-            })
+            .handle_joined_room_update(
+                Timeline::default(),
+                own_receipt,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
