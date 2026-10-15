@@ -624,12 +624,23 @@ fn cross_signed_or_legacy(refuse_legacy_from_unsigned_known_devices: bool) -> De
 }
 
 /// Alice's device as it would come in a `/keys/query` response, unsigned.
+///
+/// `display_name` is the name the server reports for the device. It is not
+/// part of what the device signs, so changing it is the way to make a device
+/// we already know come back *changed* (`DeviceChange::Updated`) without
+/// signing it: an identical device is `DeviceChange::None`, which the manager
+/// drops without re-evaluating any sender data.
 async fn alices_unsigned_device_keys_query_response(
     alice: &OlmMachine,
+    display_name: Option<&str>,
 ) -> ruma::api::client::keys::get_keys::v3::Response {
     let alice_device = DeviceData::from_machine_test_helper(alice).await.unwrap();
+    let mut device_keys = serde_json::to_value(alice_device.as_device_keys()).unwrap();
+    if let Some(display_name) = display_name {
+        device_keys["unsigned"] = json!({ "device_display_name": display_name });
+    }
     ruma_response_from_json(&json!({
-        "device_keys": { alice.user_id(): { alice.device_id(): alice_device.as_device_keys() } }
+        "device_keys": { alice.user_id(): { alice.device_id(): device_keys } }
     }))
 }
 
@@ -695,15 +706,28 @@ async fn test_imported_session_from_known_unsigned_device_is_refused() {
         );
     }
 
-    // And again once a `/keys/query` has told us about the device, which
+    // And again once a `/keys/query` has reported the device as changed, which
     // re-evaluates the sender data of the sessions from it: the imported session
-    // must neither lose its legacy flag nor slip through.
+    // must neither lose its legacy flag nor slip through. The device has to
+    // really change for that: the server reporting the very same device is
+    // `DeviceChange::None` and re-evaluates nothing.
     bob.receive_keys_query_response(
         &TransactionId::new(),
-        &alices_unsigned_device_keys_query_response(&alice).await,
+        &alices_unsigned_device_keys_query_response(&alice, Some("Alice's phone")).await,
     )
     .await
     .unwrap();
+    let changed_device = bob
+        .store()
+        .get_device_data(alice.user_id(), alice.device_id())
+        .await
+        .unwrap()
+        .expect("Bob still knows Alice's device");
+    assert_eq!(
+        changed_device.display_name(),
+        Some("Alice's phone"),
+        "the device should have changed"
+    );
     assert_matches!(
         bob.decrypt_room_event(&event, room_id, &settings).await,
         Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
@@ -738,7 +762,7 @@ async fn test_imported_session_from_known_unsigned_device_is_decrypted_by_defaul
 
     bob.receive_keys_query_response(
         &TransactionId::new(),
-        &alices_unsigned_device_keys_query_response(&alice).await,
+        &alices_unsigned_device_keys_query_response(&alice, None).await,
     )
     .await
     .unwrap();
@@ -964,6 +988,92 @@ async fn test_backup_imported_session_stays_legacy_after_keys_query() {
         &[(TrustRequirement::CrossSignedOrLegacy, true)],
     )
     .await;
+}
+
+/// The same fresh-device restore as
+/// `test_backup_imported_session_stays_legacy_after_keys_query`, with
+/// `refuse_legacy_from_unsigned_known_devices` on.
+///
+/// The outcome depends on the order in which the new device learns about
+/// things, which is what makes the rule best effort:
+///
+/// 1. Before any `/keys/query` the sender's device is unknown, so the legacy
+///    allowance applies and the event decrypts. A client that caches the
+///    plaintext at this point keeps showing it.
+/// 2. Once the unsigned device arrives as new, the session is refused like a
+///    live one from that device would be.
+/// 3. Once a `/keys/query` brings the device signed, the session is announced
+///    on the room key stream (so the client retries the event it could not
+///    decrypt) and decrypts again.
+#[async_test]
+async fn test_backup_imported_session_with_refusal_rule_depends_on_when_the_device_is_learned() {
+    // Alice sends an encrypted message to Bob's first device
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session_id) = encrypt_message(&alice, room_id, &bob, "Secret message").await;
+    let exported = bob
+        .store()
+        .get_inbound_group_session(room_id, &session_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .export()
+        .await;
+
+    // A fresh device of Bob's restores the room key from backup, knowing
+    // nothing about Alice's devices.
+    let bob2 = OlmMachine::new(tests::user_id(), ruma::device_id!("BOB2")).await;
+    bob2.store().import_room_keys(vec![exported], Some("1"), |_, _| {}).await.unwrap();
+    let settings = cross_signed_or_legacy(true);
+
+    // (i) Alice's device is unknown, so the rule has nothing to match and the
+    // event decrypts. This is the order dependence: it would not have if the
+    // `/keys/query` had come first.
+    assert!(
+        bob2.decrypt_room_event(&event, room_id, &settings).await.is_ok(),
+        "with the sender's device still unknown the legacy allowance applies",
+    );
+
+    // (ii) Alice's unsigned device arrives, as a new device for Bob2.
+    bob2.receive_keys_query_response(
+        &TransactionId::new(),
+        &alices_unsigned_device_keys_query_response(&alice, None).await,
+    )
+    .await
+    .unwrap();
+    assert_matches!(
+        bob2.decrypt_room_event(&event, room_id, &settings).await,
+        Err(MegolmError::SenderIdentityNotTrusted(VerificationLevel::UnsignedDevice))
+    );
+
+    // (iii) Alice cross-signs, and Bob2 learns of it from a `/keys/query`.
+    let mut room_keys_received_stream = Box::pin(bob2.store().room_keys_received_stream());
+
+    let bootstrap_requests = alice.bootstrap_cross_signing(false).await.unwrap();
+    bob2.receive_keys_query_response(
+        &TransactionId::new(),
+        &bootstrap_requests_to_keys_query_response(bootstrap_requests),
+    )
+    .await
+    .unwrap();
+
+    let room_key_infos = room_keys_received_stream
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("the room key stream should announce the sessions of the changed device")
+        .unwrap();
+    assert!(
+        room_key_infos.iter().any(|info| info.session_id == session_id),
+        "the imported session should have been announced, got {room_key_infos:?}",
+    );
+
+    assert!(bob2.decrypt_room_event(&event, room_id, &settings).await.is_ok());
 }
 
 /// Helper function to set up Alice's cross-signing, and save her keys in Bob's
