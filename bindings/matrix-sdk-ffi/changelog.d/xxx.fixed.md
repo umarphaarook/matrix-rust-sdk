@@ -1,0 +1,1 @@
+An incoming session verification request is no longer dropped when the profile of its sender cannot be fetched (a `404` for a user without a profile, or a `403` when the homeserver limits profile lookups to users sharing a room). The request now reaches the delegate with a profile that only carries the sender's user ID.

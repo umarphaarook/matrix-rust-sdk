@@ -26,7 +26,7 @@ use matrix_sdk::{
 };
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::UserId;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     client::UserProfile, error::ClientError, runtime::get_runtime_handle, utils::Timestamp,
@@ -326,10 +326,7 @@ impl SessionVerificationController {
             return;
         }
 
-        let Ok(sender_profile) = UserProfile::fetch(&self.account, sender).await else {
-            error!("Failed fetching user profile for verification request");
-            return;
-        };
+        let sender_profile = fetch_sender_profile_or_placeholder(&self.account, sender).await;
 
         if let Some(delegate) = Self::current_delegate(&self.delegate) {
             delegate.did_receive_verification_request(SessionVerificationRequestDetails {
@@ -513,13 +510,48 @@ impl SessionVerificationController {
     }
 }
 
+/// Fetch the profile of the sender of an incoming verification request,
+/// falling back to a placeholder when it cannot be read.
+///
+/// A user without a profile (`GET /profile` answers 404) is spec-legal, and a
+/// homeserver may refuse the lookup outright, for instance when it limits
+/// profile requests to users that share a room with the requester (403). The
+/// profile only decorates the request, so failing to read it must not drop a
+/// request that was otherwise successfully received: the placeholder carries
+/// the sender's user ID and nothing else.
+async fn fetch_sender_profile_or_placeholder(account: &Account, sender: &UserId) -> UserProfile {
+    match UserProfile::fetch(account, sender).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            warn!(
+                "Failed fetching the profile of {sender} for a verification request, \
+                 continuing without it: {error}"
+            );
+
+            UserProfile {
+                user_id: sender.to_string(),
+                display_name: None,
+                avatar_url: None,
+                status: None,
+                call: None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, RwLock};
 
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use ruma::user_id;
+    use serde_json::json;
+    use wiremock::ResponseTemplate;
+
     use super::{
         Delegate, SessionVerificationController, SessionVerificationControllerDelegate,
         SessionVerificationData, SessionVerificationRequestDetails,
+        fetch_sender_profile_or_placeholder,
     };
 
     /// A delegate that detaches itself from within a callback. The only
@@ -617,5 +649,71 @@ mod tests {
         }
 
         assert!(slot.read().unwrap().is_none(), "delegate should have detached itself");
+    }
+
+    /// A sender whose profile does not exist (404) must not make the incoming
+    /// verification request vanish: the placeholder keeps the user ID.
+    #[tokio::test]
+    async fn a_missing_sender_profile_falls_back_to_a_placeholder() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sender = user_id!("@bob:localhost");
+
+        server.mock_get_profile(sender).error_unrecognized().expect(1).mount().await;
+
+        let profile = fetch_sender_profile_or_placeholder(&client.account(), sender).await;
+
+        assert_eq!(profile.user_id, sender.as_str());
+        assert!(profile.display_name.is_none());
+        assert!(profile.avatar_url.is_none());
+        assert!(profile.status.is_none());
+        assert!(profile.call.is_none());
+    }
+
+    /// A homeserver that refuses profile lookups for users that share no room
+    /// with us (403) behaves the same.
+    #[tokio::test]
+    async fn a_forbidden_sender_profile_falls_back_to_a_placeholder() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sender = user_id!("@bob:localhost");
+
+        server
+            .mock_get_profile(sender)
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "errcode": "M_FORBIDDEN",
+                "error": "Profile lookup is limited to users that share a room",
+            })))
+            .expect(1)
+            .mount()
+            .await;
+
+        let profile = fetch_sender_profile_or_placeholder(&client.account(), sender).await;
+
+        assert_eq!(profile.user_id, sender.as_str());
+        assert!(profile.display_name.is_none());
+        assert!(profile.avatar_url.is_none());
+    }
+
+    /// A readable profile is still passed through untouched.
+    #[tokio::test]
+    async fn a_readable_sender_profile_is_used() {
+        use matrix_sdk::ruma::api::client::profile::ProfileFieldValue;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sender = user_id!("@bob:localhost");
+
+        server
+            .mock_get_profile(sender)
+            .ok_with_fields(vec![ProfileFieldValue::DisplayName("Bob".to_owned())])
+            .expect(1)
+            .mount()
+            .await;
+
+        let profile = fetch_sender_profile_or_placeholder(&client.account(), sender).await;
+
+        assert_eq!(profile.user_id, sender.as_str());
+        assert_eq!(profile.display_name.as_deref(), Some("Bob"));
     }
 }
