@@ -616,7 +616,8 @@ pub struct UserDevice {
     /// or it was verified some other way). It is the equivalent of
     /// `crossSigningVerified` in matrix-js-sdk. For a device of another user it
     /// additionally requires that we verified that user's identity; it is not
-    /// what the trust requirements check there (see `is_cross_signed_by_owner`).
+    /// what the trust requirements check there (see
+    /// `is_cross_signed_by_owner`).
     ///
     /// Unlike a plain "is this device verified" check, this never includes
     /// *local* trust, i.e. the device being marked as trusted by hand. A device
@@ -1364,9 +1365,9 @@ mod tests {
         assert!(first_seen_by_second.is_verified_with_cross_signing);
     }
 
-    /// Another user's device signed by its owner reports `is_cross_signed_by_owner`
-    /// even though we never verified that user, and only becomes
-    /// `is_verified_with_cross_signing` once we do.
+    /// Another user's device signed by its owner reports
+    /// `is_cross_signed_by_owner` even though we never verified that user,
+    /// and only becomes `is_verified_with_cross_signing` once we do.
     #[tokio::test]
     async fn get_device_of_unverified_user_is_signed_but_not_cross_signing_trusted() {
         let server = MatrixMockServer::new().await;
