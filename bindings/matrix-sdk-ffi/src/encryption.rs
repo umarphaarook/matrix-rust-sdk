@@ -600,7 +600,30 @@ pub struct UserDevice {
     /// server's say-so: it is `true` only when the owner's self-signing key,
     /// as we currently know it, has a valid signature over the device keys.
     /// It says nothing about whether *we* trust that owner.
+    ///
+    /// For a device of another user, this is the field to use: it is what the
+    /// trust requirements (`TrustRequirement::CrossSigned` and
+    /// `CrossSignedOrLegacy`) enforce when decrypting events from that device,
+    /// and what a live session from it is held to. For one of our own devices,
+    /// prefer `is_verified_with_cross_signing`.
     pub is_cross_signed_by_owner: bool,
+
+    /// Do we trust the device through cross-signing?
+    ///
+    /// For one of our own devices this is the field to use: it is `true` only
+    /// when the device is signed by our own cross-signing identity *and* that
+    /// identity is itself verified by us (this device holds its private keys,
+    /// or it was verified some other way). It is the equivalent of
+    /// `crossSigningVerified` in matrix-js-sdk. For a device of another user it
+    /// additionally requires that we verified that user's identity; it is not
+    /// what the trust requirements check there (see `is_cross_signed_by_owner`).
+    ///
+    /// Unlike a plain "is this device verified" check, this never includes
+    /// *local* trust, i.e. the device being marked as trusted by hand. A device
+    /// can be locally trusted and still report `false` here, and a device can
+    /// be `is_cross_signed_by_owner` while this is `false`, for instance a
+    /// new device that has not verified our own identity yet.
+    pub is_verified_with_cross_signing: bool,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -700,6 +723,7 @@ impl Encryption {
             device_id: device.device_id().to_string(),
             display_name: device.display_name().map(str::to_owned),
             is_cross_signed_by_owner: device.is_cross_signed_by_owner(),
+            is_verified_with_cross_signing: device.is_verified_with_cross_signing(),
         }))
     }
 
@@ -1160,7 +1184,10 @@ impl From<&matrix_sdk::encryption::OAuthCrossSigningResetInfo> for OAuthCrossSig
 mod tests {
     use std::sync::Arc;
 
-    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk::{
+        ruma::{DeviceId, UserId, owned_device_id, owned_user_id},
+        test_utils::mocks::MatrixMockServer,
+    };
     use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use serde_json::json;
     use wiremock::ResponseTemplate;
@@ -1198,6 +1225,7 @@ mod tests {
         assert_eq!(device.user_id, user_id);
         assert_eq!(device.device_id, device_id);
         assert!(!device.is_cross_signed_by_owner);
+        assert!(!device.is_verified_with_cross_signing);
 
         // Bootstrap cross-signing: the new identity signs our own device. The crypto
         // layer only learns of that signature the way it does in production, from the
@@ -1240,8 +1268,157 @@ mod tests {
 
         let device = encryption.get_device(user_id, device_id).await.unwrap().unwrap();
         assert!(device.is_cross_signed_by_owner);
+        assert!(device.is_verified_with_cross_signing);
 
         // A malformed user ID is an error, not a silent `None`.
         assert!(encryption.get_device("not a user id".to_owned(), "X".to_owned()).await.is_err());
+    }
+
+    /// A client for `user_id`/`device_id` on a mock homeserver that stores and
+    /// serves keys the way a real one does, wrapped the way the app wraps it.
+    async fn e2e_client(
+        server: &MatrixMockServer,
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> (matrix_sdk::Client, Arc<Client>) {
+        let sdk_client = server
+            .client_builder_for_crypto_end_to_end(user_id, device_id)
+            .on_builder(|b| b.cross_process_store_config(CrossProcessLockConfig::SingleProcess))
+            .build()
+            .await;
+        let client = Arc::new(Client::new(sdk_client.clone(), None, None).await.unwrap());
+        (sdk_client, client)
+    }
+
+    /// For our own devices, `is_verified_with_cross_signing` needs our own
+    /// identity to be verified, on top of the owner's signature that
+    /// `is_cross_signed_by_owner` reports: a new device that holds none of the
+    /// private keys sees the first without the second until it verifies the
+    /// identity.
+    #[tokio::test]
+    async fn get_device_distinguishes_owner_signature_from_cross_signing_trust() {
+        let server = MatrixMockServer::new().await;
+        server.mock_crypto_endpoints_preset().await;
+
+        let user_id = owned_user_id!("@alice:example.org");
+        let first_device = owned_device_id!("FIRSTDEVICE");
+        let second_device = owned_device_id!("SECONDDEVICE");
+        let (first, _first_ffi) = e2e_client(&server, &user_id, &first_device).await;
+        let (second, second_ffi) = e2e_client(&server, &user_id, &second_device).await;
+
+        // The first device bootstraps cross-signing, which signs it. The second one
+        // has none of the private keys.
+        first.encryption().bootstrap_cross_signing(None).await.unwrap();
+        server.mock_sync().ok_and_run(&first, |_| {}).await;
+        server.mock_sync().ok_and_run(&second, |_| {}).await;
+
+        // Make the second device query our own keys, as it would after a device list
+        // change.
+        server
+            .mock_sync()
+            .ok_and_run(&second, |builder| {
+                builder.add_change_device(&user_id);
+            })
+            .await;
+
+        let encryption = second_ffi.encryption();
+        let first_seen_by_second = encryption
+            .get_device(user_id.to_string(), first_device.to_string())
+            .await
+            .unwrap()
+            .expect("the second device learned of the first one");
+
+        // The owner signed it, but the second device has not verified our own identity,
+        // so it does not trust anything through cross-signing yet.
+        assert!(first_seen_by_second.is_cross_signed_by_owner);
+        assert!(!first_seen_by_second.is_verified_with_cross_signing);
+
+        // Nobody signed the second device itself, and locally trusting our own device
+        // is not cross-signing trust.
+        let own = encryption
+            .get_device(user_id.to_string(), second_device.to_string())
+            .await
+            .unwrap()
+            .expect("our own device is always in the store");
+        assert!(!own.is_cross_signed_by_owner);
+        assert!(!own.is_verified_with_cross_signing);
+
+        // Verify our own identity from the second device.
+        second
+            .encryption()
+            .get_user_identity(&user_id)
+            .await
+            .unwrap()
+            .expect("the second device knows our own identity")
+            .verify()
+            .await
+            .unwrap();
+
+        // `Device` snapshots our identity when it is looked up, so look it up again.
+        let first_seen_by_second = encryption
+            .get_device(user_id.to_string(), first_device.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_seen_by_second.is_cross_signed_by_owner);
+        assert!(first_seen_by_second.is_verified_with_cross_signing);
+    }
+
+    /// Another user's device signed by its owner reports `is_cross_signed_by_owner`
+    /// even though we never verified that user, and only becomes
+    /// `is_verified_with_cross_signing` once we do.
+    #[tokio::test]
+    async fn get_device_of_unverified_user_is_signed_but_not_cross_signing_trusted() {
+        let server = MatrixMockServer::new().await;
+        server.mock_crypto_endpoints_preset().await;
+
+        let alice_id = owned_user_id!("@alice:example.org");
+        let bob_id = owned_user_id!("@bob:example.org");
+        let bob_device = owned_device_id!("BOBDEVICE");
+        let (alice, alice_ffi) =
+            e2e_client(&server, &alice_id, &owned_device_id!("ALICEDEV")).await;
+        let (bob, _bob_ffi) = e2e_client(&server, &bob_id, &bob_device).await;
+
+        alice.encryption().bootstrap_cross_signing(None).await.unwrap();
+        bob.encryption().bootstrap_cross_signing(None).await.unwrap();
+        server.exchange_e2ee_identities(&alice, &bob).await;
+
+        let encryption = alice_ffi.encryption();
+        let bobs_device = encryption
+            .get_device(bob_id.to_string(), bob_device.to_string())
+            .await
+            .unwrap()
+            .expect("alice learned of bob's device");
+
+        // Bob's self-signing key signed the device, but alice has not verified bob.
+        assert_eq!(bobs_device.user_id, bob_id.to_string());
+        assert!(bobs_device.is_cross_signed_by_owner);
+        assert!(!bobs_device.is_verified_with_cross_signing);
+
+        // Once alice verifies bob and learns of her own signature on him, the device
+        // is trusted through cross-signing too.
+        alice
+            .encryption()
+            .get_user_identity(&bob_id)
+            .await
+            .unwrap()
+            .expect("alice knows bob's identity")
+            .verify()
+            .await
+            .unwrap();
+        server
+            .mock_sync()
+            .ok_and_run(&alice, |builder| {
+                builder.add_change_device(&bob_id);
+            })
+            .await;
+
+        let bobs_device = encryption
+            .get_device(bob_id.to_string(), bob_device.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bobs_device.is_cross_signed_by_owner);
+        assert!(bobs_device.is_verified_with_cross_signing);
     }
 }
