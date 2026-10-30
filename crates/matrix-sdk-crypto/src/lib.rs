@@ -28,6 +28,7 @@ mod gossiping;
 mod identities;
 mod machine;
 pub mod olm;
+mod restriction;
 pub mod secret_storage;
 mod session_manager;
 pub mod store;

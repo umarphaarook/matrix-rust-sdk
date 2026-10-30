@@ -592,8 +592,14 @@ impl IdentitiesBeingVerified {
         };
 
         if should_request_secrets {
-            let secret_requests = self.request_missing_secrets().await?;
-            changes.key_requests = secret_requests;
+            // A restricted (borrowed) device never asks for the account's
+            // secrets: the confirmation must not turn it into a full device.
+            if crate::restriction::load_restricted_flag(&**self.store.inner).await? {
+                info!("This device is restricted, not requesting the account's secrets");
+            } else {
+                let secret_requests = self.request_missing_secrets().await?;
+                changes.key_requests = secret_requests;
+            }
         }
 
         // TODO: store the signature upload request as well.
@@ -901,5 +907,60 @@ pub(crate) mod tests {
         };
 
         (alice, alice_store, bob, bob_store)
+    }
+
+    /// Complete a self-verification of another own device on the store set up
+    /// by `setup_stores`, the way a SAS or QR flow finishes on the device being
+    /// confirmed, and return how many secret requests that left queued.
+    async fn complete_self_verification(restricted: bool) -> usize {
+        use crate::store::types::DeviceChanges;
+
+        let (alice, alice_store, _, _) = setup_stores().await;
+        let other_device = DeviceData::from_account(&Account::with_device_id(
+            alice.user_id(),
+            device_id!("OTHERDEVICE"),
+        ));
+
+        alice_store
+            .save_changes(Changes {
+                devices: DeviceChanges { new: vec![other_device.clone()], ..Default::default() },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        if restricted {
+            alice_store
+                .inner
+                .set_custom_value(crate::restriction::RESTRICTED_DEVICE_KEY, vec![1])
+                .await
+                .unwrap();
+        }
+
+        let own_identity = alice_store.get_user_identity(alice.user_id()).await.unwrap().unwrap();
+        let identities = alice_store.get_identities(other_device.clone()).await.unwrap();
+
+        identities.mark_as_done(Some(&[other_device]), Some(&[own_identity])).await.unwrap();
+
+        alice_store
+            .inner
+            .get_unsent_secret_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| matches!(r.info, crate::SecretInfo::SecretRequest(_)))
+            .count()
+    }
+
+    #[matrix_sdk_test::async_test]
+    async fn test_confirmation_requests_secrets_when_not_restricted() {
+        // Control: without the flag, completing the confirmation queues the
+        // backup key request, so the restricted case below is not vacuous.
+        assert_eq!(complete_self_verification(false).await, 1);
+    }
+
+    #[matrix_sdk_test::async_test]
+    async fn test_confirmation_requests_no_secrets_when_restricted() {
+        assert_eq!(complete_self_verification(true).await, 0);
     }
 }

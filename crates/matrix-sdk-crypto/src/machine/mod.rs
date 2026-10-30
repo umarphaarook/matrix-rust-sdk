@@ -2152,6 +2152,45 @@ impl OlmMachine {
         Ok((sender_data, known_device))
     }
 
+    /// Mark this device as restricted, or lift the restriction.
+    ///
+    /// A restricted device is one the user confirmed but does not own (a
+    /// borrowed device). It never asks the account's other devices for the
+    /// cross-signing secrets or the backup decryption key, and it discards any
+    /// of those it is sent, so a verification completing on it does not turn it
+    /// into a full device. The flag is persisted in the crypto store.
+    ///
+    /// Set it *before* the verification that confirms the device completes:
+    /// the secret requests are created in the same step that completes the
+    /// verification.
+    ///
+    /// Marking the device restricted also drops any secret requests that were
+    /// queued but not yet sent.
+    ///
+    /// Lifting the restriction (`restricted == false`) is only meaningful once
+    /// the device holds the secrets itself, for example because the user
+    /// entered the recovery key on it.
+    pub async fn set_device_restricted(&self, restricted: bool) -> StoreResult<()> {
+        self.store().store_device_restricted(restricted).await?;
+
+        if restricted {
+            for request in self.store().get_unsent_secret_requests().await? {
+                if matches!(request.info, crate::SecretInfo::SecretRequest(_)) {
+                    self.store().delete_outgoing_secret_requests(&request.request_id).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Is this device restricted from receiving the account's secrets?
+    ///
+    /// See [`OlmMachine::set_device_restricted`].
+    pub async fn is_device_restricted(&self) -> StoreResult<bool> {
+        self.store().is_device_restricted().await
+    }
+
     /// Request missing local secrets from our devices (cross signing private
     /// keys, megolm backup). This will ask the sdk to create outgoing
     /// request to get the missing secrets.
@@ -2177,6 +2216,12 @@ impl OlmMachine {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn query_missing_secrets_from_other_sessions(&self) -> StoreResult<bool> {
+        // A restricted (borrowed) device never asks for the account's secrets.
+        if self.store().is_device_restricted().await? {
+            debug!("This device is restricted, not requesting missing secrets");
+            return Ok(false);
+        }
+
         let identity = self.inner.user_identity.lock().await;
         let mut secrets = identity.get_missing_secrets().await;
 
