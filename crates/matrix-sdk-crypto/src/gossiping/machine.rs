@@ -2634,7 +2634,10 @@ mod tests {
     /// When `bob_restricted` is set, Bob is marked restricted after his request
     /// went out, as a modified client or a late flag would leave it: the
     /// request is still on record, but the secret must be discarded.
-    async fn serve_backup_key_to_bob(bob_restricted: bool) -> (bool, usize) {
+    ///
+    /// When `with_list` is set, Alice enforces a valid own-device list that
+    /// names both devices.
+    async fn serve_backup_key_to_bob(bob_restricted: bool, with_list: bool) -> (bool, usize) {
         use futures_util::{FutureExt, pin_mut};
         use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;
         use serde_json::value::to_raw_value;
@@ -2700,6 +2703,16 @@ mod tests {
             .save_decryption_key(Some(decryption_key), None)
             .await
             .unwrap();
+        if with_list {
+            alice_machine.bootstrap_cross_signing(false).await.unwrap();
+            let devices = std::collections::BTreeSet::from([
+                alice_machine.device_id().to_owned(),
+                bob_machine.device_id().to_owned(),
+            ]);
+            let list = alice_machine.sign_own_device_list(1, devices).await.unwrap();
+            alice_machine.receive_own_device_list(Some(&list)).await.unwrap();
+        }
+
         alice_machine.inner.key_request_machine.receive_incoming_secret_request(&event);
         {
             let alice_cache = alice_machine.store().cache().await.unwrap();
@@ -2756,12 +2769,24 @@ mod tests {
     #[async_test]
     async fn test_unrestricted_device_receives_a_sent_secret() {
         // Control for the restricted case below.
-        assert_eq!(serve_backup_key_to_bob(false).await, (true, 1));
+        assert_eq!(serve_backup_key_to_bob(false, false).await, (true, 1));
     }
 
     #[async_test]
     async fn test_restricted_device_discards_a_sent_secret() {
-        assert_eq!(serve_backup_key_to_bob(true).await, (false, 0));
+        assert_eq!(serve_backup_key_to_bob(true, false).await, (false, 0));
+    }
+
+    #[async_test]
+    async fn test_unrestricted_listed_device_receives_a_sent_secret() {
+        // An account with a valid list naming the device and no restriction
+        // behaves as before: the request is served and the secret received.
+        assert_eq!(serve_backup_key_to_bob(false, true).await, (true, 1));
+    }
+
+    #[async_test]
+    async fn test_restricted_device_discards_a_secret_even_when_listed() {
+        assert_eq!(serve_backup_key_to_bob(true, true).await, (false, 0));
     }
 
     /// Alice pushes a backup key to Bob. Returns whether it reached Bob's
