@@ -69,11 +69,11 @@ mod tests {
     use ruma::{UserId, device_id, user_id};
 
     use crate::{
-        OlmMachineBuilder,
+        OlmMachineBuilder, SignatureError,
         gossiping::SecretInfo,
         machine::test_helpers::{get_machine_pair, get_machine_pair_with_session},
         store::{DynCryptoStore, MemoryStore},
-        types::requests::AnyOutgoingRequest,
+        types::{OwnDeviceListError, requests::AnyOutgoingRequest},
     };
 
     fn alice_id() -> &'static UserId {
@@ -160,5 +160,86 @@ mod tests {
 
         alice.set_device_restricted(true).await.unwrap();
         assert_eq!(unsent_secret_requests(&**alice.store()).await, 0);
+    }
+
+    /// A user's device that holds the account's secrets, with its identity
+    /// saved in its store, and a second device of the same user that knows the
+    /// public identity only.
+    async fn own_device_and_borrowed_device() -> (crate::OlmMachine, crate::OlmMachine) {
+        let user = alice_id();
+        let own = crate::OlmMachine::new(user, device_id!("OWNDEVICE")).await;
+        let borrowed = crate::OlmMachine::new(user, device_id!("BORROWED")).await;
+
+        own.bootstrap_cross_signing(false).await.unwrap();
+        let public = own.store().get_user_identity(user).await.unwrap().unwrap();
+        borrowed
+            .store()
+            .save_changes(crate::store::types::Changes {
+                identities: crate::store::types::IdentityChanges {
+                    new: vec![public],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        (own, borrowed)
+    }
+
+    fn device_set(ids: &[&str]) -> std::collections::BTreeSet<ruma::OwnedDeviceId> {
+        ids.iter().map(|id| ruma::OwnedDeviceId::from(*id)).collect()
+    }
+
+    #[async_test]
+    async fn test_own_device_signs_a_list_that_verifies() {
+        let (own, _) = own_device_and_borrowed_device().await;
+
+        let list = own.sign_own_device_list(1, device_set(&["OWNDEVICE"])).await.unwrap();
+
+        let identity =
+            own.store().get_user_identity(alice_id()).await.unwrap().unwrap().into_own().unwrap();
+        list.verify(identity.self_signing_key()).unwrap();
+        assert_eq!(list.version(), 1);
+        assert!(list.contains(device_id!("OWNDEVICE")));
+    }
+
+    #[async_test]
+    async fn test_borrowed_device_cannot_sign_a_list() {
+        let (_, borrowed) = own_device_and_borrowed_device().await;
+
+        // It does not hold the self-signing key, so it can not sign...
+        assert_matches::assert_matches!(
+            borrowed.sign_own_device_list(1, device_set(&["BORROWED"])).await,
+            Err(OwnDeviceListError::Signature(SignatureError::MissingSigningKey))
+        );
+
+        // ...and once marked restricted it refuses outright.
+        borrowed.set_device_restricted(true).await.unwrap();
+        assert_matches::assert_matches!(
+            borrowed.sign_own_device_list(1, device_set(&["BORROWED"])).await,
+            Err(OwnDeviceListError::Restricted)
+        );
+    }
+
+    #[async_test]
+    async fn test_restricted_device_cannot_sign_even_with_the_keys() {
+        let (own, _) = own_device_and_borrowed_device().await;
+
+        own.set_device_restricted(true).await.unwrap();
+        assert_matches::assert_matches!(
+            own.sign_own_device_list(1, device_set(&["OWNDEVICE"])).await,
+            Err(OwnDeviceListError::Restricted)
+        );
+    }
+
+    #[async_test]
+    async fn test_a_device_without_an_own_identity_cannot_sign_a_list() {
+        let machine = crate::OlmMachine::new(alice_id(), device_id!("NOIDENTITY")).await;
+
+        assert_matches::assert_matches!(
+            machine.sign_own_device_list(1, device_set(&["NOIDENTITY"])).await,
+            Err(OwnDeviceListError::NoOwnIdentity)
+        );
     }
 }

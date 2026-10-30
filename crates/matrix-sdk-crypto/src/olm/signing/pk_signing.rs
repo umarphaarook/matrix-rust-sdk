@@ -27,8 +27,8 @@ use crate::{
     error::SignatureError,
     olm::utility::SignJson,
     types::{
-        CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, Signatures, SigningKeys,
-        UserSigningPubkey,
+        CrossSigningKey, DeviceKeys, MasterPubkey, OwnDeviceList, SelfSigningPubkey, Signatures,
+        SigningKeys, UserSigningPubkey,
     },
 };
 
@@ -296,6 +296,33 @@ impl SelfSigning {
         let signature = self.inner.sign_json(serialized)?;
 
         device_keys.signatures.add_signature(
+            self.public_key.user_id().to_owned(),
+            DeviceKeyId::from_parts(
+                DeviceKeyAlgorithm::Ed25519,
+                self.inner.public_key.to_base64().as_str().into(),
+            ),
+            signature,
+        );
+
+        Ok(())
+    }
+
+    /// Sign an own-device list with this self-signing key, replacing any
+    /// signatures it carries.
+    pub(crate) fn sign_own_device_list(
+        &self,
+        list: &mut OwnDeviceList,
+    ) -> Result<(), SignatureError> {
+        if list.user_id() != self.public_key.user_id() {
+            return Err(SignatureError::UserIdMismatch);
+        }
+
+        let serialized = to_canonical_value(&*list)?;
+        let signature = self.inner.sign_json(serialized)?;
+
+        let signatures = list.signatures_mut();
+        signatures.clear();
+        signatures.add_signature(
             self.public_key.user_id().to_owned(),
             DeviceKeyId::from_parts(
                 DeviceKeyAlgorithm::Ed25519,

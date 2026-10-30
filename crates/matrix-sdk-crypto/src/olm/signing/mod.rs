@@ -519,6 +519,22 @@ impl PrivateCrossSigningIdentity {
         Ok(SignatureUploadRequest::new(signed_keys))
     }
 
+    /// Sign an own-device list with the self-signing key.
+    ///
+    /// Fails with [`SignatureError::MissingSigningKey`] on a device that does
+    /// not hold the self-signing key.
+    pub(crate) async fn sign_own_device_list(
+        &self,
+        list: &mut crate::types::OwnDeviceList,
+    ) -> Result<(), SignatureError> {
+        self.self_signing_key
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(SignatureError::MissingSigningKey)?
+            .sign_own_device_list(list)
+    }
+
     pub(crate) async fn sign(&self, message: &str) -> Result<Ed25519Signature, SignatureError> {
         Ok(self
             .master_key

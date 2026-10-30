@@ -15,7 +15,7 @@
 #[cfg(feature = "experimental-encrypted-state-events")]
 use std::borrow::Borrow;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -96,7 +96,7 @@ use crate::{
         },
     },
     types::{
-        EventEncryptionAlgorithm, Signatures,
+        EventEncryptionAlgorithm, OwnDeviceList, OwnDeviceListError, Signatures,
         events::{
             ToDeviceEvent, ToDeviceEvents,
             olm_v1::{AnyDecryptedOlmEvent, DecryptedRoomKeyBundleEvent, DecryptedRoomKeyEvent},
@@ -2189,6 +2189,51 @@ impl OlmMachine {
     /// See [`OlmMachine::set_device_restricted`].
     pub async fn is_device_restricted(&self) -> StoreResult<bool> {
         self.store().is_device_restricted().await
+    }
+
+    /// Sign a list of this user's own devices with the self-signing key.
+    ///
+    /// The list says which devices are the user's own, and so may be handed
+    /// the account's secrets and older message keys. Publish the result where
+    /// the user's other devices can read it (account data), and pass what is
+    /// read back through [`OlmMachine::receive_own_device_list`].
+    ///
+    /// Fails if this device is restricted, or does not hold the self-signing
+    /// key (which a restricted device never does), so a borrowed device can
+    /// not produce a valid list. A list the signing key does not match the
+    /// user's current public identity for is refused as well, since no other
+    /// device would accept it.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The version of the new list. It must be higher than the
+    ///   version of any list this device has accepted.
+    ///
+    /// * `devices` - The user's own devices, including this one.
+    pub async fn sign_own_device_list(
+        &self,
+        version: u64,
+        devices: BTreeSet<OwnedDeviceId>,
+    ) -> Result<OwnDeviceList, OwnDeviceListError> {
+        if self.store().is_device_restricted().await? {
+            return Err(OwnDeviceListError::Restricted);
+        }
+
+        let own_identity = self
+            .store()
+            .get_user_identity(self.user_id())
+            .await?
+            .and_then(|identity| identity.into_own())
+            .ok_or(OwnDeviceListError::NoOwnIdentity)?;
+
+        let mut list = OwnDeviceList::new(self.user_id().to_owned(), version, devices);
+        self.inner.user_identity.lock().await.sign_own_device_list(&mut list).await?;
+
+        // Refuse to hand out a list that no device would accept, for instance
+        // because the private key is not the one the identity advertises.
+        list.verify(own_identity.self_signing_key())?;
+
+        Ok(list)
     }
 
     /// Request missing local secrets from our devices (cross signing private

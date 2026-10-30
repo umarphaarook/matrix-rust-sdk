@@ -44,12 +44,16 @@ mod cross_signing;
 mod device_keys;
 pub mod events;
 mod one_time_keys;
+mod own_device_list;
 pub mod qr_login;
 pub mod requests;
 pub mod room_history;
 mod signatures;
 
-pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*, signatures::*};
+pub use self::{
+    backup::*, cross_signing::*, device_keys::*, one_time_keys::*, own_device_list::*,
+    signatures::*,
+};
 use crate::store::types::BackupDecryptionKey;
 
 macro_rules! from_base64 {

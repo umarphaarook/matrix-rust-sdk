@@ -7,7 +7,7 @@ use vodozemac::Ed25519PublicKey;
 use super::{CrossSigningKey, SigningKey};
 use crate::{
     DeviceData, SignatureError,
-    olm::VerifyJson,
+    olm::{SignedJsonObject, VerifyJson},
     types::{DeviceKeys, SigningKeys},
 };
 
@@ -47,6 +47,20 @@ impl SelfSigningPubkey {
     pub fn verify_device_keys(&self, device_keys: &DeviceKeys) -> Result<(), SignatureError> {
         if let Some((key_id, key)) = self.0.get_first_key_and_id() {
             key.verify_json(&self.0.user_id, key_id, device_keys)
+        } else {
+            Err(SignatureError::UnsupportedAlgorithm)
+        }
+    }
+
+    /// Verify that a signed JSON object, such as an
+    /// [`OwnDeviceList`](crate::types::OwnDeviceList), carries a valid
+    /// signature from this self-signing key.
+    pub(crate) fn verify_signed_object(
+        &self,
+        signed_object: &impl SignedJsonObject,
+    ) -> Result<(), SignatureError> {
+        if let Some((key_id, key)) = self.0.get_first_key_and_id() {
+            key.verify_json(&self.0.user_id, key_id, signed_object)
         } else {
             Err(SignatureError::UnsupportedAlgorithm)
         }
