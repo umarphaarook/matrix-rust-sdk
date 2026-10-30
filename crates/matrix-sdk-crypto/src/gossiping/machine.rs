@@ -314,6 +314,12 @@ impl GossipMachine {
         &self,
         secret_name: SecretName,
     ) -> Result<HashMap<OwnedDeviceId, OlmError>, SecretPushError> {
+        // A restricted (borrowed) device never hands out the account's secrets.
+        if self.inner.store.is_device_restricted().await? {
+            info!(?secret_name, "Not pushing a secret, this device is restricted");
+            return Ok(HashMap::new());
+        }
+
         let content = if let Some(secret) = self.inner.store.export_secret(&secret_name).await? {
             SecretPushContent::new(secret_name.clone(), secret)
         } else {
@@ -411,6 +417,25 @@ impl GossipMachine {
             warn!(?sender, device_id = ?device.device_id(), "Received secret push from unverified device");
             return Ok(());
         }
+        // Verified is not enough: a borrowed device is verified too. With an
+        // own-device list in force (or required), the sender has to be on it.
+        if !self.inner.store.own_device_list_permits(device.device_id(), device.ed25519_key()).await
+        {
+            warn!(
+                ?sender,
+                device_id = ?device.device_id(),
+                "Received secret push from a device that isn't on the own-device list",
+            );
+            return Ok(());
+        }
+
+        // Only the secrets the inbox is purged of when a device becomes
+        // restricted may enter it, so a restriction leaves nothing behind.
+        if !crate::machine::KNOWN_SECRET_NAMES.contains(&event.content.name) {
+            warn!(secret_name = ?event.content.name, "Dropping a pushed secret with an unknown name");
+            return Ok(());
+        }
+
         changes.secrets.push(event.content.clone().into());
         Ok(())
     }
@@ -429,6 +454,12 @@ impl GossipMachine {
                 return Ok(None);
             }
         };
+
+        // A restricted (borrowed) device never serves the account's secrets.
+        if self.inner.store.is_device_restricted().await? {
+            info!(?secret_name, "Not serving a secret request, this device is restricted");
+            return Ok(None);
+        }
 
         let content = if let Some(secret) = self.inner.store.export_secret(secret_name).await? {
             SecretSendContent::new(event.content.request_id.to_owned(), secret)
@@ -1091,10 +1122,20 @@ impl GossipMachine {
             self.inner.store.get_device_from_curve_key(&secret.event.sender, sender_key).await?
         {
             // Only accept secrets from one of our own trusted devices.
-            if device.user_id() == self.user_id() && device.is_verified() {
+            if device.user_id() == self.user_id()
+                && device.is_verified()
+                && self
+                    .inner
+                    .store
+                    .own_device_list_permits(device.device_id(), device.ed25519_key())
+                    .await
+            {
                 self.accept_secret(secret, changes).await?;
             } else {
-                warn!("Received a m.secret.send event from another user or from unverified device");
+                warn!(
+                    "Received a m.secret.send event from another user, from an unverified device \
+                     or from a device that isn't on the own-device list"
+                );
             }
         } else {
             warn!("Received a m.secret.send event from an unknown device");
@@ -1194,7 +1235,13 @@ impl GossipMachine {
             self.inner.store.get_device_from_curve_key(&info.request_recipient, sender_key).await?;
 
         if let Some(device) = device {
-            Ok(device.user_id() == self.user_id() && device.is_verified())
+            Ok(device.user_id() == self.user_id()
+                && device.is_verified()
+                && self
+                    .inner
+                    .store
+                    .own_device_list_permits(device.device_id(), device.ed25519_key())
+                    .await)
         } else {
             Ok(false)
         }
@@ -1914,8 +1961,28 @@ mod tests {
 
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_key_share_cycle(algorithm: EventEncryptionAlgorithm, with_list: bool) {
+        key_share_cycle(algorithm, with_list, None).await;
+    }
+
+    /// `alice_list` is what Alice, who receives the forwarded key, enforces:
+    /// `Some(true)` a list that names Bob, `Some(false)` one that does not.
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn key_share_cycle(
+        algorithm: EventEncryptionAlgorithm,
+        with_list: bool,
+        alice_list: Option<bool>,
+    ) {
         let (alice_machine, group_session, bob_machine) =
             machines_for_key_share_test_helper(alice_id(), true, algorithm).await;
+
+        if let Some(names_bob) = alice_list {
+            setup_own_identity(&alice_machine).await;
+            let mut devices = vec![alice_machine.device_id()];
+            if names_bob {
+                devices.push(bob_machine.device_id());
+            }
+            enforce_own_device_list(&alice_machine, 1, &devices).await;
+        }
 
         if with_list {
             // Bob, who answers, has accepted a signed list naming both devices.
@@ -1995,6 +2062,12 @@ mod tests {
             .receive_forwarded_room_key(decrypted.result.sender_key, ev)
             .await
             .unwrap();
+
+        if alice_list == Some(false) {
+            assert!(session.is_none(), "a key forwarded by a device off the list is dropped");
+            return;
+        }
+
         alice_machine.inner.store.save_inbound_group_sessions(&[session.unwrap()]).await.unwrap();
 
         // Check that alice now does have the session.
@@ -2093,6 +2166,18 @@ mod tests {
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_key_share_cycle_megolm_v1() {
         test_key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2, false).await;
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_a_receiver_accepts_a_forwarded_key_from_a_listed_device() {
+        key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2, false, Some(true)).await;
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_a_receiver_drops_a_forwarded_key_from_a_verified_device_off_the_list() {
+        key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2, false, Some(false)).await;
     }
 
     #[async_test]
@@ -2734,6 +2819,45 @@ mod tests {
         assert!(stream.next().now_or_never().flatten().is_none());
     }
 
+    /// What the receiving device has accepted.
+    #[derive(Clone, Copy, Debug)]
+    enum Receiver {
+        /// No own-device list at all: as before.
+        NoList,
+        /// A list that names the sender.
+        Listed,
+        /// A list that does not name the sender, who is verified all the same.
+        OffList,
+        /// A list that names the sender, then the identity is replaced.
+        ListedThenIdentityReplaced,
+    }
+
+    /// Give `receiver` the list `mode` describes, after the sender is known
+    /// and verified there.
+    async fn give_receiver_list(
+        sender: &crate::machine::OlmMachine,
+        receiver: &crate::machine::OlmMachine,
+        mode: Receiver,
+    ) {
+        if matches!(mode, Receiver::NoList) {
+            return;
+        }
+
+        receiver.bootstrap_cross_signing(false).await.unwrap();
+        let mut devices = std::collections::BTreeMap::from([(
+            receiver.device_id().to_owned(),
+            receiver.identity_keys().ed25519,
+        )]);
+        if !matches!(mode, Receiver::OffList) {
+            devices.insert(sender.device_id().to_owned(), sender.identity_keys().ed25519);
+        }
+        receiver.sign_own_device_list(1, devices).await.unwrap();
+
+        if matches!(mode, Receiver::ListedThenIdentityReplaced) {
+            receiver.bootstrap_cross_signing(true).await.unwrap();
+        }
+    }
+
     /// Alice serves a backup key to her other device Bob, who asked for it,
     /// and Bob receives it. Returns whether the secret reached Bob's secrets
     /// stream and how many secrets are in Bob's inbox afterwards.
@@ -2745,6 +2869,14 @@ mod tests {
     /// When `with_list` is set, Alice enforces a valid own-device list that
     /// names both devices.
     async fn serve_backup_key_to_bob(bob_restricted: bool, with_list: bool) -> (bool, usize) {
+        serve_backup_key_to_bob_with(bob_restricted, with_list, Receiver::NoList).await
+    }
+
+    async fn serve_backup_key_to_bob_with(
+        bob_restricted: bool,
+        with_list: bool,
+        receiver: Receiver,
+    ) -> (bool, usize) {
         use futures_util::{FutureExt, pin_mut};
         use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;
         use serde_json::value::to_raw_value;
@@ -2803,6 +2935,7 @@ mod tests {
         alice_device.set_trust_state(LocalTrust::Verified);
         alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
         bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
+        give_receiver_list(&alice_machine, &bob_machine, receiver).await;
 
         let decryption_key = crate::store::types::BackupDecryptionKey::new();
         alice_machine
@@ -2892,6 +3025,26 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_a_listed_receiver_accepts_a_sent_secret_from_a_listed_sender() {
+        assert_eq!(serve_backup_key_to_bob_with(false, false, Receiver::Listed).await, (true, 1));
+    }
+
+    #[async_test]
+    async fn test_a_receiver_drops_a_sent_secret_from_a_verified_sender_off_its_list() {
+        // The sender is verified, as a confirmed borrowed device is, but the
+        // list the receiver enforces does not name it.
+        assert_eq!(serve_backup_key_to_bob_with(false, false, Receiver::OffList).await, (false, 0));
+    }
+
+    #[async_test]
+    async fn test_a_receiver_drops_a_sent_secret_when_the_list_is_under_a_replaced_identity() {
+        assert_eq!(
+            serve_backup_key_to_bob_with(false, false, Receiver::ListedThenIdentityReplaced).await,
+            (false, 0)
+        );
+    }
+
+    #[async_test]
     async fn test_restricted_device_discards_a_secret_even_when_listed() {
         assert_eq!(serve_backup_key_to_bob(true, true).await, (false, 0));
     }
@@ -2900,6 +3053,14 @@ mod tests {
     /// secrets stream and how many secrets are in his inbox.
     #[cfg(feature = "experimental-push-secrets")]
     async fn push_backup_key_to_bob(bob_restricted: bool) -> (bool, usize) {
+        push_backup_key_to_bob_with(bob_restricted, Receiver::NoList).await
+    }
+
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn push_backup_key_to_bob_with(
+        bob_restricted: bool,
+        receiver: Receiver,
+    ) -> (bool, usize) {
         use futures_util::{FutureExt, pin_mut};
         use serde_json::value::to_raw_value;
         use tokio_stream::StreamExt;
@@ -2927,6 +3088,7 @@ mod tests {
         // Alice is trusted by Bob, so an unrestricted Bob accepts the push.
         alice_device.set_trust_state(LocalTrust::Verified);
         bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
+        give_receiver_list(&alice_machine, &bob_machine, receiver).await;
         if bob_restricted {
             bob_machine.set_device_restricted(true).await.unwrap();
         }
@@ -2973,6 +3135,114 @@ mod tests {
     async fn test_unrestricted_device_accepts_a_pushed_secret() {
         // Control for the restricted case below.
         assert_eq!(push_backup_key_to_bob(false).await, (true, 1));
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_a_listed_receiver_accepts_a_pushed_secret_from_a_listed_sender() {
+        assert_eq!(push_backup_key_to_bob_with(false, Receiver::Listed).await, (true, 1));
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_a_receiver_drops_a_pushed_secret_from_a_verified_sender_off_its_list() {
+        // The N1 attack: a verified borrowed device pushes the decryption key
+        // of a backup it controls.
+        assert_eq!(push_backup_key_to_bob_with(false, Receiver::OffList).await, (false, 0));
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_a_receiver_drops_a_pushed_secret_when_the_list_is_under_a_replaced_identity() {
+        assert_eq!(
+            push_backup_key_to_bob_with(false, Receiver::ListedThenIdentityReplaced).await,
+            (false, 0)
+        );
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_a_pushed_secret_with_an_unknown_name_is_dropped() {
+        use ruma::events::secret::request::SecretName;
+
+        let (alice_machine, alice_device, bob_machine, bob_device, _key) =
+            set_up_secret_push().await;
+        let _ = (bob_device, alice_machine);
+        alice_device.set_trust_state(LocalTrust::Verified);
+        bob_machine
+            .store()
+            .save_device_data(std::slice::from_ref(&alice_device.inner))
+            .await
+            .unwrap();
+
+        let content = crate::types::events::secret_push::SecretPushContent::new(
+            SecretName::from("org.example.custom"),
+            "secret".to_owned(),
+        );
+        let event = crate::types::events::olm_v1::DecryptedSecretPushEvent::new(
+            bob_machine.user_id(),
+            bob_machine.user_id(),
+            alice_device.ed25519_key().unwrap(),
+            None,
+            content,
+        );
+        let mut changes = Changes::default();
+        bob_machine
+            .inner
+            .key_request_machine
+            .receive_secret_push_event(
+                &alice_device.curve25519_key().unwrap(),
+                &event,
+                &mut changes,
+            )
+            .await
+            .unwrap();
+        assert!(changes.secrets.is_empty());
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_restricted_device_queues_no_push() {
+        let (alice_machine, _alice_device, _bob_machine, bob_device, _decryption_key) =
+            set_up_secret_push().await;
+        bob_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+
+        alice_machine.set_device_restricted(true).await.unwrap();
+        alice_machine
+            .inner
+            .key_request_machine
+            .push_secret_to_verified_devices(SecretName::RecoveryKey)
+            .await
+            .unwrap();
+        assert!(
+            alice_machine
+                .inner
+                .key_request_machine
+                .outgoing_to_device_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Control: lifting the restriction pushes.
+        alice_machine.set_device_restricted(false).await.unwrap();
+        alice_machine
+            .inner
+            .key_request_machine
+            .push_secret_to_verified_devices(SecretName::RecoveryKey)
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_machine
+                .inner
+                .key_request_machine
+                .outgoing_to_device_requests()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[async_test]
@@ -3052,6 +3322,13 @@ mod tests {
     /// Alice (the machine) is asked for a secret by her other, verified
     /// device. Returns whether she answers.
     async fn alice_answers_secret_request(list: Option<&[&DeviceId]>) -> bool {
+        alice_answers_secret_request_with(list, false).await
+    }
+
+    async fn alice_answers_secret_request_with(
+        list: Option<&[&DeviceId]>,
+        alice_restricted: bool,
+    ) -> bool {
         let alice_machine = get_machine_test_helper().await;
 
         let mut second_account = alice_2_account();
@@ -3077,6 +3354,9 @@ mod tests {
         if let Some(devices) = list {
             enforce_own_device_list(&alice_machine, 1, devices).await;
         }
+        if alice_restricted {
+            alice_machine.inner.store.store_device_restricted(true).await.unwrap();
+        }
 
         let event = RumaToDeviceEvent::new(
             alice_id().to_owned(),
@@ -3100,6 +3380,18 @@ mod tests {
     #[async_test]
     async fn test_secret_request_without_a_list_is_served_as_before() {
         assert!(alice_answers_secret_request(None).await);
+    }
+
+    #[async_test]
+    async fn test_restricted_device_does_not_serve_a_secret_request() {
+        assert!(!alice_answers_secret_request_with(None, true).await);
+        assert!(
+            !alice_answers_secret_request_with(
+                Some(&[alice_device_id(), alice2_device_id()]),
+                true
+            )
+            .await
+        );
     }
 
     #[async_test]

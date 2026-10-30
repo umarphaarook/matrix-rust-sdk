@@ -130,6 +130,15 @@ pub struct RawEncryptionResult {
     pub encryption_info: EncryptionInfo,
 }
 
+/// The secrets that may wait in the secret inbox. Anything else that is pushed
+/// is dropped, so that restricting a device can purge the whole inbox.
+pub(crate) const KNOWN_SECRET_NAMES: [SecretName; 4] = [
+    SecretName::RecoveryKey,
+    SecretName::CrossSigningMasterKey,
+    SecretName::CrossSigningUserSigningKey,
+    SecretName::CrossSigningSelfSigningKey,
+];
+
 /// A builder object to help creating an [`OlmMachine`] instance.
 pub struct OlmMachineBuilder {
     /// The unique id of the user that owns the machine to be built.
@@ -2197,12 +2206,7 @@ impl OlmMachine {
                 }
             }
 
-            for name in [
-                SecretName::RecoveryKey,
-                SecretName::CrossSigningMasterKey,
-                SecretName::CrossSigningUserSigningKey,
-                SecretName::CrossSigningSelfSigningKey,
-            ] {
+            for name in KNOWN_SECRET_NAMES {
                 self.store().delete_secrets_from_inbox(&name).await?;
             }
         }
@@ -2262,9 +2266,12 @@ impl OlmMachine {
     ///   device, after signing, does not accept the list as its own (for
     ///   example because the version is below the floor the application set).
     ///
-    /// * `devices` - The user's own devices, including this one, each with its
-    ///   Ed25519 identity key. A device is on the list only with that key, so a
-    ///   new device given the ID of a deleted one is not.
+    /// * `devices` - The user's own devices, which must include this one, each
+    ///   with its Ed25519 identity key. Every entry must be a known, verified
+    ///   device whose key matches the one stored here, or
+    ///   [`OwnDeviceListError::InvalidDevice`] is returned. A device is on the
+    ///   list only with that key, so a new device given the ID of a deleted one
+    ///   is not.
     ///
     /// The signed list is accepted by this device before it is returned, so a
     /// device that signs enforces the list from that moment, whether or not
@@ -2284,6 +2291,40 @@ impl OlmMachine {
             .await?
             .and_then(|identity| identity.into_own())
             .ok_or(OwnDeviceListError::NoOwnIdentity)?;
+
+        // The list has to name the signer: a device that leaves itself out
+        // would not serve from its own list.
+        if !devices.contains_key(self.device_id()) {
+            return Err(OwnDeviceListError::NotAccepted(OwnDeviceListOutcome::ThisDeviceNotListed));
+        }
+
+        // Every entry must be a device we know, with the key we have for it,
+        // and verified, so that an app bug, or a key the server supplied for
+        // an unverified device, can not reach a signed list.
+        for (device_id, key) in &devices {
+            if device_id == self.device_id() {
+                if *key != self.identity_keys().ed25519 {
+                    return Err(OwnDeviceListError::InvalidDevice(
+                        device_id.clone(),
+                        "not this device's key",
+                    ));
+                }
+                continue;
+            }
+
+            let Some(device) = self.store().get_device(self.user_id(), device_id).await? else {
+                return Err(OwnDeviceListError::InvalidDevice(device_id.clone(), "unknown device"));
+            };
+            if device.ed25519_key() != Some(*key) {
+                return Err(OwnDeviceListError::InvalidDevice(
+                    device_id.clone(),
+                    "the key differs from the stored key",
+                ));
+            }
+            if !device.is_verified() {
+                return Err(OwnDeviceListError::InvalidDevice(device_id.clone(), "not verified"));
+            }
+        }
 
         if let Some(seen) = self.store().highest_accepted_own_device_list_version().await?
             && version <= seen
@@ -2356,17 +2397,8 @@ impl OlmMachine {
             .filter(|identity| identity.is_verified())
             .ok_or(OwnDeviceListError::NoOwnIdentity)?;
 
-        {
-            let private = self.inner.user_identity.lock().await;
-            let holds_current_keys = private.has_master_key().await
-                && private.can_sign_devices().await
-                && private.self_signing_public_key().await.and_then(|k| k.get_first_key())
-                    == own_identity.self_signing_key().get_first_key()
-                && private.master_public_key().await.and_then(|k| k.get_first_key())
-                    == own_identity.master_key().get_first_key();
-            if !holds_current_keys {
-                return Err(OwnDeviceListError::SecretsNotHeld);
-            }
+        if !self.store().holds_cross_signing_keys_of(&own_identity).await {
+            return Err(OwnDeviceListError::SecretsNotHeld);
         }
 
         self.store().forget_own_device_list_state().await?;

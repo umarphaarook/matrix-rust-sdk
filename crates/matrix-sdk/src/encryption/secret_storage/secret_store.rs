@@ -398,6 +398,15 @@ impl SecretStore {
     /// # anyhow::Ok(()) };
     /// ```
     ///
+    /// # Restricted devices
+    ///
+    /// A device marked restricted (see `OlmMachine::set_device_restricted`)
+    /// does not take part in the key backup, so enabling the backup at the end
+    /// of this call fails for it. An application that recovers on such a
+    /// device must first prove the recovery key by opening this store, then
+    /// lift the restriction, call this method, and set the restriction again
+    /// if the import fails.
+    ///
     /// [`Device`]: crate::encryption::identities::Device
     #[instrument(fields(user_id, device_id, cross_signing_status))]
     pub async fn import_secrets(&self) -> Result<()> {

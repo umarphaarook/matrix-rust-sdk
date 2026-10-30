@@ -41,10 +41,17 @@
 //! identity, but a server that swaps it flips the device's verification of its
 //! own identity off (the master key changes), which stops list checking and
 //! serving at once. The remembered version belongs to the self-signing key it
-//! was seen under: when the user resets their cross-signing keys and verifies
-//! the new identity, lists under the new key start again from version 1.
+//! was seen under. When the user resets their cross-signing keys, lists under
+//! the new key are accepted only if the new master key was signed by a device
+//! on the last list this device accepted (or after the application adopts the
+//! new identity), and the application keeps numbering above the version floor.
 //! Serving also requires the remembered key to be the current one, so a list
 //! signed under a key that has since been replaced serves nobody.
+//!
+//! A list is accepted only if it names this very device, with this device's
+//! own Ed25519 key. A list that leaves this device out means it was removed,
+//! and it serves nobody. That also pins the first list a new device accepts:
+//! a list from before the device existed can not name its key.
 
 use std::collections::BTreeMap;
 
@@ -99,6 +106,11 @@ impl StoredState {
             devices: BTreeMap::new(),
             serving: false,
         }
+    }
+
+    /// Is this the sentinel for a state that could not be read?
+    fn is_unreadable_sentinel(&self) -> bool {
+        self.self_signing_key.is_empty()
     }
 }
 
@@ -155,6 +167,18 @@ pub enum OwnDeviceListOutcome {
     /// ([`OlmMachine::adopt_own_identity_for_device_list`](crate::OlmMachine)),
     /// which needs this device to hold the identity's private keys.
     NewIdentityNotAnchored,
+
+    /// The list is valid but does not name this device with this device's own
+    /// key: this device was removed, or the list is from before it existed.
+    /// The version is remembered, but nothing is served.
+    ThisDeviceNotListed,
+
+    /// The state this device had remembered can not be read. Nothing is
+    /// served, and no list is accepted, until the application adopts the
+    /// current identity
+    /// ([`OlmMachine::adopt_own_identity_for_device_list`](crate::OlmMachine)),
+    /// or the device is set up again.
+    StateUnreadable,
 }
 
 /// What checking a candidate list against our own identity found.
@@ -241,14 +265,28 @@ impl Store {
 
     /// Refuse every list below `floor`, and serve nobody off a list below it.
     ///
-    /// The application reads the highest version it has ever signed from a
-    /// place only holders of the account's secrets can read (secret storage)
-    /// when a device becomes an own device, and sets it here before it accepts
-    /// any list. The server can not lower it. It is not tied to a
-    /// self-signing key: after the user resets cross-signing, the application
-    /// resets the floor too.
+    /// The floor only ever goes up: a lower value than the one already set is
+    /// ignored. The one exception is a stored floor that can not be read
+    /// (which counts as the highest possible), which the next call replaces.
+    /// The floor is not tied to a self-signing key and is never reset, not
+    /// even after the user resets cross-signing: the first list under a new
+    /// identity continues the numbering above it. A device that adopts a new
+    /// identity and then sees [`OwnDeviceListOutcome::Rewound`] signs a list
+    /// at `seen + 1`.
+    ///
+    /// The application can read the highest version ever signed from secret
+    /// storage when a device becomes an own device. Secret storage is not
+    /// protected against rollback by the server, so this is defence in depth:
+    /// the real guard against a replayed list is that a list has to name this
+    /// device's own key.
     pub async fn set_own_device_list_version_floor(&self, floor: u64) -> Result<()> {
         let _guard = self.own_device_list_lock().lock().await;
+
+        let current = match self.get_custom_value(OWN_DEVICE_LIST_FLOOR_KEY).await? {
+            None => Some(0u64),
+            Some(bytes) => rmp_serde::from_slice::<u64>(&bytes).ok(),
+        };
+        let floor = current.map_or(floor, |current| current.max(floor));
 
         self.set_value(OWN_DEVICE_LIST_FLOOR_KEY, &floor).await?;
 
@@ -261,6 +299,48 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// Is our own identity the one the remembered list state was accepted
+    /// under? `true` when there is no state at all.
+    ///
+    /// Once a list has been accepted, a different self-signing key means the
+    /// identity was replaced and this device has not (yet) anchored the new
+    /// one, so nothing signed by the new identity may be trusted on the
+    /// strength of the list. Any failure to find out counts as `false`.
+    pub(crate) async fn own_identity_matches_list_state(&self) -> bool {
+        let result: Result<bool> = async {
+            let Some(state) = self.load_own_device_list_state().await? else {
+                return Ok(true);
+            };
+            let current = self
+                .get_user_identity(self.user_id())
+                .await?
+                .and_then(|identity| identity.into_own())
+                .as_ref()
+                .and_then(self_signing_key_base64);
+            Ok(current.as_deref() == Some(state.self_signing_key.as_str()))
+        }
+        .await;
+
+        result.unwrap_or_else(|error| {
+            error!(%error, "Can't read the own-device list state");
+            false
+        })
+    }
+
+    /// Does this device hold the private master and self-signing keys that
+    /// match the public ones of `identity`?
+    pub(crate) async fn holds_cross_signing_keys_of(&self, identity: &OwnUserIdentityData) -> bool {
+        let private = self.private_identity();
+        let private = private.lock().await;
+
+        private.has_master_key().await
+            && private.can_sign_devices().await
+            && private.self_signing_public_key().await.and_then(|k| k.get_first_key())
+                == identity.self_signing_key().get_first_key()
+            && private.master_public_key().await.and_then(|k| k.get_first_key())
+                == identity.master_key().get_first_key()
     }
 
     /// Our own identity, if we have verified it.
@@ -369,9 +449,14 @@ impl Store {
         let evaluation = self.evaluate_own_device_list(current.as_ref(), candidate).await?;
 
         let (outcome, new_state) = match (evaluation, candidate) {
-            (Evaluation::Valid { self_signing_key, anchored }, Some(list)) => {
-                Self::decide(current.as_ref(), floor, self_signing_key, anchored, list)
-            }
+            (Evaluation::Valid { self_signing_key, anchored }, Some(list)) => Self::decide(
+                current.as_ref(),
+                floor,
+                self_signing_key,
+                anchored,
+                (&self.static_account().device_id, self.static_account().identity_keys().ed25519),
+                list,
+            ),
             (Evaluation::Missing, _) => (OwnDeviceListOutcome::Missing, None),
             (Evaluation::NoTrustedIdentity, _) => (OwnDeviceListOutcome::NoTrustedIdentity, None),
             (Evaluation::Invalid, _) | (Evaluation::Valid { .. }, None) => {
@@ -405,6 +490,38 @@ impl Store {
     /// Returns the outcome, and the state to keep if the candidate was
     /// usable. `None` means the candidate was refused.
     fn decide(
+        current: Option<&StoredState>,
+        floor: u64,
+        self_signing_key: String,
+        anchored: bool,
+        own_device: (&DeviceId, Ed25519PublicKey),
+        list: &OwnDeviceList,
+    ) -> (OwnDeviceListOutcome, Option<StoredState>) {
+        if current.is_some_and(StoredState::is_unreadable_sentinel) {
+            return (OwnDeviceListOutcome::StateUnreadable, None);
+        }
+
+        let (outcome, state) =
+            Self::decide_version(current, floor, self_signing_key, anchored, list);
+
+        // A list that does not name this device, with this device's key, means
+        // it was removed (or that the list predates it). The version is
+        // remembered so the list can not be replayed, but nothing is served.
+        match (outcome, state) {
+            (OwnDeviceListOutcome::Accepted { .. }, Some(state))
+                if !list.contains(own_device.0, &own_device.1) =>
+            {
+                warn!("The own-device list does not name this device, no longer serving");
+                (
+                    OwnDeviceListOutcome::ThisDeviceNotListed,
+                    Some(StoredState { serving: false, ..state }),
+                )
+            }
+            other => other,
+        }
+    }
+
+    fn decide_version(
         current: Option<&StoredState>,
         floor: u64,
         self_signing_key: String,
@@ -543,7 +660,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, LazyLock},
+    };
 
     use assert_matches2::assert_matches;
     use matrix_sdk_test::async_test;
@@ -553,12 +673,11 @@ mod tests {
 
     use super::{OWN_DEVICE_LIST_FLOOR_KEY, OWN_DEVICE_LIST_STATE_KEY, OwnDeviceListOutcome};
     use crate::{
-        OlmMachine, OlmMachineBuilder,
+        DeviceData, LocalTrust, OlmMachine, OlmMachineBuilder,
         olm::PrivateCrossSigningIdentity,
         store::MemoryStore,
         types::{
-            OwnDeviceList, OwnDeviceListError,
-            own_device_list::tests::{devices as fake_devices, key as fake_key},
+            DeviceKeys, OwnDeviceList, OwnDeviceListError, own_device_list::tests::key as fake_key,
         },
     };
 
@@ -577,10 +696,29 @@ mod tests {
         device_id!("DEVICEC")
     }
 
+    /// Real device keys for `B()` and `C()`, made once per process: a list can
+    /// only be signed for devices the signer knows, with their stored keys.
+    static OTHER_DEVICES: LazyLock<(DeviceKeys, DeviceKeys)> = LazyLock::new(|| {
+        let user = user_id!("@alice:example.org");
+        (
+            crate::Account::with_device_id(user, B()).device_keys(),
+            crate::Account::with_device_id(user, C()).device_keys(),
+        )
+    });
+
     /// The key a test device has: the machine's own key for `A()`, which the
-    /// machine really signs with, and a made-up one for the others.
+    /// machine really signs with, the real keys of `B()` and `C()`, and a
+    /// made-up one for anything else.
     fn key_of(machine: &OlmMachine, id: &DeviceId) -> Ed25519PublicKey {
-        if id == A() { machine.identity_keys().ed25519 } else { fake_key(id.as_str()) }
+        if id == A() {
+            machine.identity_keys().ed25519
+        } else if id == B() {
+            DeviceData::try_from(&OTHER_DEVICES.0).unwrap().ed25519_key().unwrap()
+        } else if id == C() {
+            DeviceData::try_from(&OTHER_DEVICES.1).unwrap().ed25519_key().unwrap()
+        } else {
+            fake_key(id.as_str())
+        }
     }
 
     fn set(machine: &OlmMachine, ids: &[&DeviceId]) -> BTreeMap<OwnedDeviceId, Ed25519PublicKey> {
@@ -611,7 +749,17 @@ mod tests {
     async fn own_machine() -> OlmMachine {
         let machine = OlmMachine::new(user_id!("@alice:example.org"), A()).await;
         machine.bootstrap_cross_signing(false).await.unwrap();
+        add_verified_devices(&machine).await;
         machine
+    }
+
+    /// Make `B()` and `C()` known, verified devices of the machine.
+    async fn add_verified_devices(machine: &OlmMachine) {
+        for keys in [&OTHER_DEVICES.0, &OTHER_DEVICES.1] {
+            let device = DeviceData::try_from(keys).unwrap();
+            device.set_trust_state(LocalTrust::Verified);
+            machine.store().save_device_data(&[device]).await.unwrap();
+        }
     }
 
     async fn permits(machine: &OlmMachine, device: &DeviceId) -> bool {
@@ -906,6 +1054,7 @@ mod tests {
 
         let machine = build().await;
         machine.bootstrap_cross_signing(false).await.unwrap();
+        add_verified_devices(&machine).await;
         let v1 = machine.sign_own_device_list(1, set(&machine, &[A(), B()])).await.unwrap();
         machine.receive_own_device_list(Some(&v1)).await.unwrap();
         let v2 = machine.sign_own_device_list(2, set(&machine, &[A()])).await.unwrap();
@@ -942,7 +1091,7 @@ mod tests {
         let list = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
         assert_eq!(
             machine.receive_own_device_list(Some(&list)).await.unwrap(),
-            OwnDeviceListOutcome::NewIdentityNotAnchored
+            OwnDeviceListOutcome::StateUnreadable
         );
         assert!(!permits(&machine, B()).await);
 
@@ -1231,13 +1380,21 @@ mod tests {
         // The list names A with a key that is not the one A signs with.
         let mut devices = set(&machine, &[A(), B()]);
         devices.insert(A().to_owned(), fake_key("NOT A'S KEY"));
-        machine.sign_own_device_list(1, devices).await.unwrap();
+        // (Another own device signed it; this device would refuse to.)
+        let list = sign_only(&machine, 1, devices).await;
+        machine.receive_own_device_list(Some(&list)).await.unwrap();
 
         // The new master key is signed by A's real key, which the list does
         // not bind to A, so the identity is not anchored.
         let other = OlmMachine::new(user_id!("@alice:example.org"), A()).await;
         other.bootstrap_cross_signing(false).await.unwrap();
-        let hers = other.sign_own_device_list(1, fake_devices(&["DEVICEA"])).await.unwrap();
+        let hers = other
+            .sign_own_device_list(
+                1,
+                BTreeMap::from([(A().to_owned(), other.identity_keys().ed25519)]),
+            )
+            .await
+            .unwrap();
         replace_public_identity(&machine, &other).await;
 
         assert_eq!(
@@ -1262,6 +1419,24 @@ mod tests {
             )
             .await
             .unwrap();
+        // The list that names this device as well, as the app would sign it
+        // once it knows this device.
+        let mut fresh_list_with_this_device = OwnDeviceList::new(
+            machine.user_id().to_owned(),
+            2,
+            BTreeMap::from([
+                (device_id!("FRESH").to_owned(), fresh.identity_keys().ed25519),
+                (A().to_owned(), machine.identity_keys().ed25519),
+            ]),
+        );
+        fresh
+            .store()
+            .private_identity()
+            .lock()
+            .await
+            .sign_own_device_list(&mut fresh_list_with_this_device)
+            .await
+            .unwrap();
         replace_public_identity(&machine, &fresh).await;
 
         assert_eq!(
@@ -1280,9 +1455,18 @@ mod tests {
         machine.store().import_secrets_bundle(&bundle).await.unwrap();
         machine.adopt_own_identity_for_device_list().await.unwrap();
         assert_eq!(machine.own_device_list_status().await.unwrap(), None);
+
+        // A list that does not name this device is still not accepted...
         assert_eq!(
             machine.receive_own_device_list(Some(&fresh_list)).await.unwrap(),
-            OwnDeviceListOutcome::Accepted { version: 1 }
+            OwnDeviceListOutcome::ThisDeviceNotListed
+        );
+        assert!(!permits(&machine, A()).await);
+
+        // ...one that does is.
+        assert_eq!(
+            machine.receive_own_device_list(Some(&fresh_list_with_this_device)).await.unwrap(),
+            OwnDeviceListOutcome::Accepted { version: 2 }
         );
     }
 
@@ -1295,5 +1479,160 @@ mod tests {
             machine.adopt_own_identity_for_device_list().await,
             Err(OwnDeviceListError::Restricted)
         );
+    }
+
+    #[async_test]
+    async fn test_a_list_that_leaves_this_device_out_serves_nobody() {
+        let machine = own_machine().await;
+        machine.sign_own_device_list(1, set(&machine, &[A(), B()])).await.unwrap();
+        assert!(permits(&machine, B()).await);
+
+        // Another own device removes this one in version 2.
+        let removed = sign_only(&machine, 2, set(&machine, &[B(), C()])).await;
+        assert_eq!(
+            machine.receive_own_device_list(Some(&removed)).await.unwrap(),
+            OwnDeviceListOutcome::ThisDeviceNotListed
+        );
+        assert!(!permits(&machine, B()).await);
+        assert!(!permits(&machine, C()).await);
+        let status = machine.own_device_list_status().await.unwrap().unwrap();
+        assert_eq!((status.version, status.serving), (2, false));
+
+        // The old list that still names this device can not bring it back.
+        let old = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
+        assert_eq!(
+            machine.receive_own_device_list(Some(&old)).await.unwrap(),
+            OwnDeviceListOutcome::Rewound { seen: 2, got: 1 }
+        );
+        assert!(!permits(&machine, B()).await);
+    }
+
+    #[async_test]
+    async fn test_a_new_device_does_not_accept_a_list_from_before_it_existed() {
+        let machine = own_machine().await;
+
+        // A genuine, correctly signed old list, with the floor never set. It
+        // can not name this device's key, so even the first accept is pinned.
+        let old = sign_only(&machine, 1, fake_devices_with(&[B(), C()])).await;
+        machine.set_own_device_list_required(true).await.unwrap();
+        assert_eq!(
+            machine.receive_own_device_list(Some(&old)).await.unwrap(),
+            OwnDeviceListOutcome::ThisDeviceNotListed
+        );
+        assert!(!permits(&machine, B()).await);
+    }
+
+    fn fake_devices_with(ids: &[&DeviceId]) -> BTreeMap<OwnedDeviceId, Ed25519PublicKey> {
+        ids.iter().map(|id| ((*id).to_owned(), fake_key(id.as_str()))).collect()
+    }
+
+    #[async_test]
+    async fn test_a_signer_must_name_itself() {
+        let machine = own_machine().await;
+
+        assert_matches!(
+            machine.sign_own_device_list(1, set(&machine, &[B(), C()])).await,
+            Err(OwnDeviceListError::NotAccepted(OwnDeviceListOutcome::ThisDeviceNotListed))
+        );
+        assert_eq!(machine.own_device_list_status().await.unwrap(), None);
+    }
+
+    #[async_test]
+    async fn test_the_signer_only_lists_known_verified_devices_with_their_stored_keys() {
+        let machine = own_machine().await;
+
+        // Unknown device.
+        let mut devices = set(&machine, &[A()]);
+        devices.insert(device_id!("UNKNOWN").to_owned(), fake_key("UNKNOWN"));
+        assert_matches!(
+            machine.sign_own_device_list(1, devices).await,
+            Err(OwnDeviceListError::InvalidDevice(_, "unknown device"))
+        );
+
+        // A known device with a key the store does not have for it.
+        let mut devices = set(&machine, &[A(), B()]);
+        devices.insert(B().to_owned(), fake_key("SERVER SUPPLIED"));
+        assert_matches!(
+            machine.sign_own_device_list(1, devices).await,
+            Err(OwnDeviceListError::InvalidDevice(_, "the key differs from the stored key"))
+        );
+
+        // This device with a key that is not its own.
+        let mut devices = set(&machine, &[A()]);
+        devices.insert(A().to_owned(), fake_key("NOT MINE"));
+        assert_matches!(
+            machine.sign_own_device_list(1, devices).await,
+            Err(OwnDeviceListError::InvalidDevice(_, "not this device's key"))
+        );
+
+        // A known device that is not verified.
+        let unverified =
+            OlmMachine::new(user_id!("@alice:example.org"), device_id!("UNVERIFIED")).await;
+        let device = DeviceData::try_from(
+            &unverified.store().cache().await.unwrap().account().await.unwrap().device_keys(),
+        )
+        .unwrap();
+        machine.store().save_device_data(&[device]).await.unwrap();
+        let mut devices = set(&machine, &[A()]);
+        devices.insert(device_id!("UNVERIFIED").to_owned(), unverified.identity_keys().ed25519);
+        assert_matches!(
+            machine.sign_own_device_list(1, devices).await,
+            Err(OwnDeviceListError::InvalidDevice(_, "not verified"))
+        );
+
+        assert_eq!(machine.own_device_list_status().await.unwrap(), None);
+    }
+
+    #[async_test]
+    async fn test_the_version_floor_only_goes_up() {
+        let machine = own_machine().await;
+
+        machine.set_own_device_list_version_floor(5).await.unwrap();
+        machine.set_own_device_list_version_floor(3).await.unwrap();
+        assert_eq!(machine.own_device_list_version_floor().await.unwrap(), 5);
+        machine.set_own_device_list_version_floor(9).await.unwrap();
+        assert_eq!(machine.own_device_list_version_floor().await.unwrap(), 9);
+
+        // Only an unreadable floor may be replaced by a lower one.
+        machine
+            .store()
+            .set_custom_value(OWN_DEVICE_LIST_FLOOR_KEY, b"\xc1".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(machine.own_device_list_version_floor().await.unwrap(), u64::MAX);
+        machine.set_own_device_list_version_floor(2).await.unwrap();
+        assert_eq!(machine.own_device_list_version_floor().await.unwrap(), 2);
+    }
+
+    #[async_test]
+    async fn test_verifying_a_replaced_own_identity_needs_its_keys() {
+        let machine = own_machine().await;
+        machine.sign_own_device_list(1, set(&machine, &[A(), B()])).await.unwrap();
+
+        // A borrowed device replaced the identity.
+        let borrowed =
+            OlmMachine::new(user_id!("@alice:example.org"), device_id!("BORROWED")).await;
+        borrowed.bootstrap_cross_signing(false).await.unwrap();
+        replace_public_identity(&machine, &borrowed).await;
+        let identity = |m: &OlmMachine| {
+            let m = m.clone();
+            async move { m.get_identity(m.user_id(), None).await.unwrap().unwrap().own().unwrap() }
+        };
+
+        // One tap would sign the new master key with this device's key, which
+        // the list would then count as an anchor.
+        assert_matches!(
+            identity(&machine).await.verify().await,
+            Err(crate::SignatureError::UnanchoredIdentity)
+        );
+
+        // With the new identity's private keys in hand it is allowed.
+        let bundle = borrowed.store().export_secrets_bundle().await.unwrap();
+        machine.store().import_secrets_bundle(&bundle).await.unwrap();
+        identity(&machine).await.verify().await.unwrap();
+
+        // And with no list at all nothing changes.
+        let other = own_machine().await;
+        identity(&other).await.verify().await.unwrap();
     }
 }

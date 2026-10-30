@@ -309,6 +309,12 @@ pub enum SignatureError {
     #[error(transparent)]
     JsonError(#[from] CanonicalJsonError),
 
+    /// The own identity was replaced since this device accepted an own-device
+    /// list, and this device does not hold the new identity's private keys,
+    /// so it will not vouch for the new identity.
+    #[error("the own cross-signing identity changed and this device does not hold its keys")]
+    UnanchoredIdentity,
+
     /// This device is restricted: it does not sign anything on the account's
     /// behalf.
     #[error("this device is restricted and does not sign on the account's behalf")]

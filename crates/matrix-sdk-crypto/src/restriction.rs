@@ -187,17 +187,21 @@ mod tests {
         (own, borrowed)
     }
 
+    /// A list naming just this machine, with its real key.
     fn device_set(
-        ids: &[&str],
+        machine: &crate::OlmMachine,
     ) -> std::collections::BTreeMap<ruma::OwnedDeviceId, vodozemac::Ed25519PublicKey> {
-        crate::types::own_device_list::tests::devices(ids)
+        std::collections::BTreeMap::from([(
+            machine.device_id().to_owned(),
+            machine.identity_keys().ed25519,
+        )])
     }
 
     #[async_test]
     async fn test_own_device_signs_a_list_that_verifies() {
         let (own, _) = own_device_and_borrowed_device().await;
 
-        let list = own.sign_own_device_list(1, device_set(&["OWNDEVICE"])).await.unwrap();
+        let list = own.sign_own_device_list(1, device_set(&own)).await.unwrap();
 
         let identity =
             own.store().get_user_identity(alice_id()).await.unwrap().unwrap().into_own().unwrap();
@@ -212,14 +216,14 @@ mod tests {
 
         // It does not hold the self-signing key, so it can not sign...
         assert_matches::assert_matches!(
-            borrowed.sign_own_device_list(1, device_set(&["BORROWED"])).await,
+            borrowed.sign_own_device_list(1, device_set(&borrowed)).await,
             Err(OwnDeviceListError::Signature(SignatureError::MissingSigningKey))
         );
 
         // ...and once marked restricted it refuses outright.
         borrowed.set_device_restricted(true).await.unwrap();
         assert_matches::assert_matches!(
-            borrowed.sign_own_device_list(1, device_set(&["BORROWED"])).await,
+            borrowed.sign_own_device_list(1, device_set(&borrowed)).await,
             Err(OwnDeviceListError::Restricted)
         );
     }
@@ -230,7 +234,7 @@ mod tests {
 
         own.set_device_restricted(true).await.unwrap();
         assert_matches::assert_matches!(
-            own.sign_own_device_list(1, device_set(&["OWNDEVICE"])).await,
+            own.sign_own_device_list(1, device_set(&own)).await,
             Err(OwnDeviceListError::Restricted)
         );
     }
@@ -240,7 +244,7 @@ mod tests {
         let machine = crate::OlmMachine::new(alice_id(), device_id!("NOIDENTITY")).await;
 
         assert_matches::assert_matches!(
-            machine.sign_own_device_list(1, device_set(&["NOIDENTITY"])).await,
+            machine.sign_own_device_list(1, device_set(&machine)).await,
             Err(OwnDeviceListError::NoOwnIdentity)
         );
     }

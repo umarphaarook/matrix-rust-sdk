@@ -232,7 +232,18 @@ impl OwnUserIdentity {
     /// device.
     ///
     /// Returns a signature upload request that needs to be sent out.
+    ///
+    /// Fails with [`SignatureError::UnanchoredIdentity`] if this device has
+    /// accepted an own-device list under another cross-signing identity and
+    /// does not hold the private keys of this one: signing the new master key
+    /// with this device's key would make it count as trusted by the list.
     pub async fn verify(&self) -> Result<SignatureUploadRequest, SignatureError> {
+        if !self.store.own_identity_matches_list_state().await
+            && !self.store.holds_cross_signing_keys_of(&self.inner).await
+        {
+            return Err(SignatureError::UnanchoredIdentity);
+        }
+
         self.mark_as_verified();
 
         let changes = Changes {

@@ -27,7 +27,7 @@ use futures_util::StreamExt;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_base::crypto::{
-    OlmMachine, RoomKeyImportResult,
+    OlmMachine, RoomKeyImportResult, SignatureError,
     backups::MegolmV1BackupKey,
     store::types::BackupDecryptionKey,
     types::{RoomKeyBackupInfo, requests::KeysBackupRequest},
@@ -132,8 +132,13 @@ impl Backups {
             // [spec]: https://spec.matrix.org/v1.8/client-server-api/#server-side-key-backups
             let mut backup_info = decryption_key.to_backup_info();
 
-            if let Err(e) = olm_machine.backup_machine().sign_backup(&mut backup_info).await {
-                warn!("Unable to sign the newly created backup version: {e:?}");
+            match olm_machine.backup_machine().sign_backup(&mut backup_info).await {
+                Ok(()) => {}
+                // A restricted (borrowed) device must not create a backup at all:
+                // fail before the version is uploaded, so there is nothing to
+                // switch to and no key to push to the account's other devices.
+                Err(e @ SignatureError::DeviceRestricted) => return Err(e.into()),
+                Err(e) => warn!("Unable to sign the newly created backup version: {e:?}"),
             }
 
             let algorithm = Raw::new(&backup_info)?.cast();
@@ -805,6 +810,30 @@ impl Backups {
         &self,
         maybe_recovery_key: &str,
     ) -> Result<bool, EnableBackupError> {
+        self.maybe_enable_backups_inner(maybe_recovery_key, false).await
+    }
+
+    /// Like [`Backups::maybe_enable_backups`], for a key that came out of the
+    /// secret inbox (a key another device sent or pushed to us).
+    ///
+    /// A key the user typed or that we read from secret storage is trusted
+    /// because of where it came from. A key that arrived by gossip is not: any
+    /// verified device of the account can send one, and the backup version it
+    /// matches may be one that device created. So the version is adopted only
+    /// if the backup itself is trusted (signed by the master key, or by this
+    /// device, or by a device the own-device list permits).
+    async fn maybe_enable_backups_from_inbox(
+        &self,
+        maybe_recovery_key: &str,
+    ) -> Result<bool, EnableBackupError> {
+        self.maybe_enable_backups_inner(maybe_recovery_key, true).await
+    }
+
+    async fn maybe_enable_backups_inner(
+        &self,
+        maybe_recovery_key: &str,
+        require_trusted_backup: bool,
+    ) -> Result<bool, EnableBackupError> {
         let _guard = self.client.locks().backup_modify_lock.lock().await;
 
         // Create a future here which allows us to catch any failure that might happen
@@ -844,6 +873,16 @@ impl Backups {
                 // backups are enabled.
                 Ok(true)
             } else if decryption_key.backup_key_matches(&backup_info) {
+                if require_trusted_backup
+                    && !backup_machine.verify_backup(backup_info.clone(), false).await?.trusted()
+                {
+                    warn!(
+                        "A backup recovery key from the secret inbox matches the current backup \
+                         version, but that backup isn't trusted, not enabling it"
+                    );
+                    return Ok(false);
+                }
+
                 info!(
                     "We have found the correct backup recovery key. Storing the backup recovery \
                      key and enabling backups."
@@ -954,7 +993,7 @@ impl Backups {
         let secrets = olm_machine.store().get_secrets_from_inbox(&SecretName::RecoveryKey).await?;
 
         for secret in secrets {
-            match self.maybe_enable_backups(&secret).await {
+            match self.maybe_enable_backups_from_inbox(&secret).await {
                 Ok(enabled) => {
                     if enabled {
                         break;
@@ -1213,14 +1252,9 @@ mod test {
         let backups = client.encryption().backups();
         let backup_decryption_key = BackupDecryptionKey::new();
 
-        let matching_public_key = derive_public_key_from(&backup_decryption_key);
-
-        server
-            .mock_room_keys_version()
-            .exists_with_key(&matching_public_key.to_base64())
-            .expect(1)
-            .mount()
-            .await;
+        // The backup is signed by this device, as one the account made would be.
+        let signed = signed_backup_info(&client, &backup_decryption_key).await;
+        mount_backup_version(&server, &signed).await;
 
         // Given there is a backup decryption key waiting in the secrets inbox, which is
         // consistent with the public key
@@ -1234,6 +1268,77 @@ mod test {
 
         // And the backup state is now enabled
         assert_eq!(backups.state(), BackupState::Enabled);
+    }
+
+    #[async_test]
+    async fn test_resuming_backups_ignores_a_key_for_an_untrusted_backup() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        let backup_decryption_key = BackupDecryptionKey::new();
+
+        // The key matches the backup on the server, but nothing the account
+        // trusts has signed that backup: another device made it and then sent
+        // us its key.
+        let matching_public_key = derive_public_key_from(&backup_decryption_key);
+        server
+            .mock_room_keys_version()
+            .exists_with_key(&matching_public_key.to_base64())
+            .expect(1)
+            .mount()
+            .await;
+
+        queue_backup_decryption_key_secret(client.clone(), &backup_decryption_key.to_base64())
+            .await;
+
+        let res = backups.maybe_resume_backups().await;
+
+        assert_matches!(res, Ok(_));
+        assert_eq!(backups.state(), BackupState::Unknown);
+        assert!(!backups.are_enabled().await);
+    }
+
+    #[async_test]
+    async fn test_creating_a_backup_on_a_restricted_device_fails_before_the_upload() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        {
+            let olm_machine = client.olm_machine().await;
+            olm_machine.as_ref().unwrap().set_device_restricted(true).await.unwrap();
+        }
+
+        // No `POST` is mounted: if the version were uploaded the request would
+        // fail with a 404, a different error from the one asserted here.
+        let res = client.encryption().backups().create().await;
+
+        assert_matches!(
+            res,
+            Err(Error::SignatureError(matrix_sdk_base::crypto::SignatureError::DeviceRestricted))
+        );
+        assert_eq!(client.encryption().backups().state(), BackupState::Unknown);
+    }
+
+    /// The backup info for `key`, signed by this client's own device.
+    async fn signed_backup_info(client: &Client, key: &BackupDecryptionKey) -> serde_json::Value {
+        let mut info = key.to_backup_info();
+        let guard = client.olm_machine().await;
+        guard.as_ref().unwrap().backup_machine().sign_backup(&mut info).await.unwrap();
+        serde_json::to_value(&info).unwrap()
+    }
+
+    async fn mount_backup_version(server: &MatrixMockServer, info: &serde_json::Value) {
+        let mut body = info.clone();
+        let fields = body.as_object_mut().unwrap();
+        fields.insert("count".to_owned(), 42.into());
+        fields.insert("etag".to_owned(), "anopaquestring".into());
+        fields.insert("version".to_owned(), "1".into());
+        server
+            .mock_room_keys_version()
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount()
+            .await;
     }
 
     #[async_test]

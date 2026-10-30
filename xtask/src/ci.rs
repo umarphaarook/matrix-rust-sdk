@@ -339,6 +339,25 @@ fn run_crypto_tests() -> Result<()> {
     .run()?;
     cmd!(sh, "rustup run stable cargo nextest run -p matrix-sdk-crypto --features=experimental-encrypted-state-events").run()?;
 
+    // The Zaure borrowed-device restriction gates code that is only compiled
+    // with these features (room key forwarding and secret pushing), so run
+    // the crate's tests with all of them on.
+    cmd!(
+        sh,
+        "rustup run stable cargo clippy -p matrix-sdk-crypto --features=testing,automatic-room-key-forwarding,experimental-push-secrets -- -D warnings"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "rustup run stable cargo nextest run -p matrix-sdk-crypto --features=testing,automatic-room-key-forwarding,experimental-push-secrets"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "rustup run stable cargo test --doc -p matrix-sdk-crypto --features=testing,automatic-room-key-forwarding,experimental-push-secrets"
+    )
+    .run()?;
+
     cmd!(sh, "rustup run stable cargo nextest run -p matrix-sdk-crypto-ffi").run()?;
 
     cmd!(

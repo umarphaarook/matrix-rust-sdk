@@ -175,7 +175,12 @@ impl BackupMachine {
         let ret = if let Some(identity) = identity.and_then(|i| i.own()) {
             match identity.master_key().has_signed_raw(signatures, auth_data) {
                 Ok(_) => {
-                    if identity.is_verified() {
+                    // After an own-device list was accepted, a replaced
+                    // identity that this device has not anchored (see
+                    // `OwnDeviceListOutcome::NewIdentityNotAnchored`) vouches
+                    // for nothing, even if the user verified it.
+                    if identity.is_verified() && self.store.own_identity_matches_list_state().await
+                    {
                         SignatureState::ValidAndTrusted
                     } else {
                         SignatureState::ValidButNotTrusted
@@ -395,14 +400,21 @@ impl BackupMachine {
     /// This will use the [`m.megolm_backup.v1.curve25519-aes-sha2`] algorithm
     /// to encrypt the room keys.
     ///
+    /// Fails with [`CryptoStoreError::DeviceRestricted`] on a restricted
+    /// device, which never takes part in the account's key backup, not even to
+    /// upload to a backup it was handed the public key of.
+    ///
+    /// Note for callers that restore a device from the recovery key: importing
+    /// the secrets ends here, so on a device that is still restricted it
+    /// fails. Prove the recovery key first, lift the restriction, and only
+    /// then import the secrets.
+    ///
     /// [`m.megolm_backup.v1.curve25519-aes-sha2`]:
     /// https://spec.matrix.org/unstable/client-server-api/#backup-algorithm-mmegolm_backupv1curve25519-aes-sha2
     pub async fn enable_backup_v1(&self, key: MegolmV1BackupKey) -> Result<(), CryptoStoreError> {
-        // A restricted device never takes part in the account's key backup,
-        // not even to upload to a backup it was handed the public key of.
         if self.store.is_device_restricted().await? {
             warn!("Refusing to activate a backup on a restricted device");
-            return Ok(());
+            return Err(CryptoStoreError::DeviceRestricted);
         }
 
         if key.backup_version().is_some() {
@@ -1045,7 +1057,63 @@ mod tests {
         };
         assert!(data.signatures.is_empty());
 
-        machine.backup_machine().enable_backup_v1(key).await.unwrap();
+        assert!(matches!(
+            machine.backup_machine().enable_backup_v1(key).await,
+            Err(crate::CryptoStoreError::DeviceRestricted)
+        ));
         assert!(!machine.backup_machine().enabled().await);
+    }
+
+    #[async_test]
+    async fn test_a_replaced_unanchored_identity_does_not_make_a_backup_trusted() {
+        let own = OlmMachine::new(alice_id(), device_id!("OWNDEVICE")).await;
+        own.bootstrap_cross_signing(false).await.unwrap();
+        let devices = BTreeMap::from([(own.device_id().to_owned(), own.identity_keys().ed25519)]);
+
+        // A borrowed device makes a new identity and signs a backup with its
+        // master key.
+        let borrowed = OlmMachine::new(alice_id(), device_id!("BORROWED")).await;
+        borrowed.bootstrap_cross_signing(false).await.unwrap();
+        let mut backup_info = BackupDecryptionKey::new().to_backup_info();
+        borrowed.backup_machine().sign_backup(&mut backup_info).await.unwrap();
+
+        let replace = |own: OlmMachine, borrowed: OlmMachine| async move {
+            let identity = borrowed
+                .store()
+                .get_user_identity(alice_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_own()
+                .unwrap();
+            identity.mark_as_verified();
+            own.store()
+                .save_changes(Changes {
+                    identities: crate::store::types::IdentityChanges {
+                        changed: vec![identity.into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        };
+
+        // Control: with no list the user's verification of the new identity
+        // is all that is needed, as before.
+        let control = OlmMachine::new(alice_id(), device_id!("CONTROL")).await;
+        control.bootstrap_cross_signing(false).await.unwrap();
+        replace(control.clone(), borrowed.clone()).await;
+        let result =
+            control.backup_machine().verify_backup(backup_info.clone(), true).await.unwrap();
+        assert!(result.user_identity_signature.trusted());
+
+        // With a list accepted under the old identity, the same replacement
+        // vouches for nothing.
+        own.sign_own_device_list(1, devices).await.unwrap();
+        replace(own.clone(), borrowed.clone()).await;
+        let result = own.backup_machine().verify_backup(backup_info, true).await.unwrap();
+        assert!(!result.user_identity_signature.trusted());
+        assert!(!result.trusted());
     }
 }

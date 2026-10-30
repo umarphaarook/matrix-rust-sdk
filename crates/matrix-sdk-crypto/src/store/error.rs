@@ -26,6 +26,11 @@ pub type Result<T, E = CryptoStoreError> = std::result::Result<T, E>;
 /// The crypto store's error type.
 #[derive(Debug, Error)]
 pub enum CryptoStoreError {
+    /// The device is restricted (borrowed) and so does not take part in the
+    /// account's key backup.
+    #[error("this device is restricted and does not take part in the key backup")]
+    DeviceRestricted,
+
     /// The account that owns the sessions, group sessions, and devices wasn't
     /// found.
     #[error("can't save/load sessions or group sessions in the store before an account is stored")]

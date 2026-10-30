@@ -241,6 +241,11 @@ pub enum OwnDeviceListError {
     #[error("the signed own-device list was not accepted: {0:?}")]
     NotAccepted(crate::OwnDeviceListOutcome),
 
+    /// An entry can not be signed: the device is unknown here, its key is not
+    /// the one stored for it, or it is not verified.
+    #[error("device {0} can not be put on the own-device list: {1}")]
+    InvalidDevice(OwnedDeviceId, &'static str),
+
     /// This device does not hold the private keys of the current cross-signing
     /// identity.
     #[error("this device does not hold the account's current cross-signing secrets")]
