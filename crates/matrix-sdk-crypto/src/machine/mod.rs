@@ -2258,7 +2258,9 @@ impl OlmMachine {
     /// * `version` - The version of the new list. It must be higher than the
     ///   version of any list this device has accepted under the current
     ///   self-signing key, or [`OwnDeviceListError::VersionNotAboveSeen`] is
-    ///   returned.
+    ///   returned. [`OwnDeviceListError::NotAccepted`] is returned if this
+    ///   device, after signing, does not accept the list as its own (for
+    ///   example because the version is below the floor the application set).
     ///
     /// * `devices` - The user's own devices, including this one, each with its
     ///   Ed25519 identity key. A device is on the list only with that key, so a
