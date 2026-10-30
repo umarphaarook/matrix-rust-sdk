@@ -2231,7 +2231,9 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `version` - The version of the new list. It must be higher than the
-    ///   version of any list this device has accepted.
+    ///   version of any list this device has accepted under the current
+    ///   self-signing key, or [`OwnDeviceListError::VersionNotAboveSeen`] is
+    ///   returned.
     ///
     /// * `devices` - The user's own devices, including this one.
     pub async fn sign_own_device_list(
@@ -2249,6 +2251,12 @@ impl OlmMachine {
             .await?
             .and_then(|identity| identity.into_own())
             .ok_or(OwnDeviceListError::NoOwnIdentity)?;
+
+        if let Some(seen) = self.store().highest_accepted_own_device_list_version().await?
+            && version <= seen
+        {
+            return Err(OwnDeviceListError::VersionNotAboveSeen { seen, requested: version });
+        }
 
         let mut list = OwnDeviceList::new(self.user_id().to_owned(), version, devices);
         self.inner.user_identity.lock().await.sign_own_device_list(&mut list).await?;

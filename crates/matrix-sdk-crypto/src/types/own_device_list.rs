@@ -170,6 +170,19 @@ pub enum OwnDeviceListError {
     #[error("this device is restricted and can not change the own-device list")]
     Restricted,
 
+    /// The requested version is not above the highest version this device has
+    /// accepted, so the list would be refused, by this device and by every
+    /// other device that has seen the higher one.
+    #[error(
+        "the own-device list version {requested} is not above the highest version seen, {seen}"
+    )]
+    VersionNotAboveSeen {
+        /// The highest version this device has accepted.
+        seen: u64,
+        /// The version that was requested.
+        requested: u64,
+    },
+
     /// This device has no own user identity to check the list against.
     #[error("there is no own user identity to check the own-device list against")]
     NoOwnIdentity,
@@ -270,7 +283,7 @@ mod tests {
         with_extra_device["devices"] = json!(["A", "BORROWED"]);
         let mut with_higher_version = json.clone();
         with_higher_version["version"] = json!(99);
-        let mut for_other_user = json.clone();
+        let mut for_other_user = json;
         for_other_user["user_id"] = json!("@mallory:example.org");
 
         for forged in [with_extra_device, with_higher_version, for_other_user] {
