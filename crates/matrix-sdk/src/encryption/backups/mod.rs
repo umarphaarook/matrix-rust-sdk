@@ -52,7 +52,7 @@ use ruma::{
     serde::Raw,
 };
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
-use tracing::{Span, error, info, instrument, trace, warn};
+use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 pub mod futures;
 pub(crate) mod types;
@@ -469,11 +469,26 @@ impl Backups {
         })
     }
 
+    /// Whether this device is restricted, and so takes no part in the key
+    /// backup: nothing is downloaded with a decryption key it may still have
+    /// stored from before it was restricted.
+    async fn is_restricted(olm_machine: &OlmMachine) -> Result<bool, Error> {
+        let restricted = olm_machine.is_device_restricted().await?;
+        if restricted {
+            debug!("Not using the key backup, this device is restricted");
+        }
+        Ok(restricted)
+    }
+
     /// Download all room keys for a certain room from the server-side key
     /// backup.
     pub async fn download_room_keys_for_room(&self, room_id: &RoomId) -> Result<(), Error> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        if Self::is_restricted(olm_machine).await? {
+            return Ok(());
+        }
 
         let backup_keys = olm_machine.store().load_backup_keys().await?;
 
@@ -510,6 +525,10 @@ impl Backups {
     ) -> Result<bool, Error> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        if Self::is_restricted(olm_machine).await? {
+            return Ok(false);
+        }
 
         let backup_keys = olm_machine.store().load_backup_keys().await?;
 
@@ -630,6 +649,15 @@ impl Backups {
         decryption_key: BackupDecryptionKey,
         version: String,
     ) -> Result<(), Error> {
+        {
+            let olm_machine = self.client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+            if Self::is_restricted(olm_machine).await? {
+                return Ok(());
+            }
+        }
+
         let request = get_backup_keys::v3::Request::new(version.clone());
         let response = self.client.send(request).await?;
 
@@ -844,6 +872,13 @@ impl Backups {
             let olm_machine = self.client.olm_machine().await;
             let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
             let backup_machine = olm_machine.backup_machine();
+
+            // Before anything is disabled or saved: a restricted device takes
+            // no part in the backup, and `enable_backup_v1` would refuse only
+            // after the previous state was gone.
+            if olm_machine.is_device_restricted().await? {
+                return Err(matrix_sdk_base::crypto::CryptoStoreError::DeviceRestricted.into());
+            }
 
             let decryption_key =
                 BackupDecryptionKey::from_base64(maybe_recovery_key).map_err(|e| {
@@ -1352,6 +1387,67 @@ mod test {
 
         assert_eq!(backups.state(), BackupState::Unknown);
         assert!(!backups.are_enabled().await);
+    }
+
+    /// A client whose device was restricted after it stored a backup key and
+    /// version, as when an own device is demoted.
+    async fn restricted_client_with_a_stored_backup_key() -> (MatrixMockServer, Client) {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        {
+            let guard = client.olm_machine().await;
+            let machine = guard.as_ref().unwrap();
+            machine
+                .backup_machine()
+                .save_decryption_key(Some(BackupDecryptionKey::new()), Some("1".to_owned()))
+                .await
+                .unwrap();
+            machine.set_device_restricted(true).await.unwrap();
+        }
+        (server, client)
+    }
+
+    #[async_test]
+    async fn test_enabling_backups_on_a_restricted_device_changes_nothing() {
+        let (_server, client) = restricted_client_with_a_stored_backup_key().await;
+        let before = {
+            let guard = client.olm_machine().await;
+            guard.as_ref().unwrap().store().load_backup_keys().await.unwrap()
+        };
+
+        // No `GET` for the version is mounted: reaching the server would be a
+        // different error.
+        let res = client
+            .encryption()
+            .backups()
+            .maybe_enable_backups(&BackupDecryptionKey::new().to_base64())
+            .await;
+
+        assert_matches!(res, Err(EnableBackupError::Error(Error::CryptoStoreError(e))));
+        assert_matches!(*e, matrix_sdk_base::crypto::CryptoStoreError::DeviceRestricted);
+
+        // Nothing was disabled or saved before the error.
+        let after = {
+            let guard = client.olm_machine().await;
+            guard.as_ref().unwrap().store().load_backup_keys().await.unwrap()
+        };
+        assert_eq!(after.backup_version, before.backup_version);
+        assert_eq!(
+            after.decryption_key.as_ref().map(|k| k.to_base64()),
+            before.decryption_key.as_ref().map(|k| k.to_base64())
+        );
+    }
+
+    #[async_test]
+    async fn test_a_restricted_device_downloads_nothing_with_a_stored_backup_key() {
+        // No download endpoint is mounted: a request would fail with an error.
+        let (_server, client) = restricted_client_with_a_stored_backup_key().await;
+        let backups = client.encryption().backups();
+        let room_id = ruma::room_id!("!room:localhost");
+
+        assert!(!backups.download_room_key(room_id, "session").await.unwrap());
+        backups.download_room_keys_for_room(room_id).await.unwrap();
+        backups.download_all_room_keys(BackupDecryptionKey::new(), "1".to_owned()).await.unwrap();
     }
 
     /// The backup info for `key`, signed by this client's own device.

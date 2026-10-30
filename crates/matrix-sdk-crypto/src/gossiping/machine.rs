@@ -2430,6 +2430,168 @@ mod tests {
         stream.next().now_or_never().expect("The broadcaster should have sent out the secret");
     }
 
+    /// A device that is approved as one of the account's own drops the first
+    /// answer to its secret request, because the list that names it arrives
+    /// later. When the list is accepted the request goes out again, and the
+    /// next answer is taken.
+    #[async_test]
+    async fn test_a_dropped_secret_answer_is_asked_for_again_once_the_list_names_the_device() {
+        use futures_util::{FutureExt, pin_mut};
+        use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;
+        use serde_json::value::to_raw_value;
+        use tokio_stream::StreamExt;
+
+        use crate::{
+            EncryptionSyncChanges,
+            machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
+        };
+
+        let alice_id = user_id!("@alice:localhost");
+        let (alice_machine, bob_machine) =
+            get_machine_pair_with_setup_sessions_test_helper(alice_id, alice_id, false).await;
+
+        // Bob enforces the own-device list but has not accepted one yet.
+        bob_machine.bootstrap_cross_signing(false).await.unwrap();
+        bob_machine.set_own_device_list_required(true).await.unwrap();
+
+        let key_requests = GossipMachine::request_missing_secrets(
+            bob_machine.user_id(),
+            vec![SecretName::RecoveryKey],
+        );
+        let mut changes = Changes::default();
+        let request_id = key_requests[0].request_id.to_owned();
+        changes.key_requests = key_requests;
+        bob_machine.store().save_changes(changes).await.unwrap();
+        for request in bob_machine.outgoing_requests().await.unwrap() {
+            bob_machine
+                .mark_request_as_sent(request.request_id(), &ToDeviceResponse::new())
+                .await
+                .unwrap();
+        }
+        let sent_out = || async {
+            bob_machine
+                .store()
+                .get_secret_request_by_info(&crate::SecretInfo::SecretRequest(
+                    SecretName::RecoveryKey,
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .sent_out
+        };
+        assert!(sent_out().await);
+
+        let bob_device = alice_machine
+            .get_device(alice_id, bob_machine.device_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let alice_device = bob_machine
+            .get_device(alice_id, alice_machine.device_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        bob_device.set_trust_state(LocalTrust::Verified);
+        alice_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+        bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
+
+        alice_machine
+            .backup_machine()
+            .save_decryption_key(Some(crate::store::types::BackupDecryptionKey::new()), None)
+            .await
+            .unwrap();
+
+        // Alice answers the request, and Bob receives the answer.
+        let answer = || async {
+            let event = RumaToDeviceEvent::new(
+                alice_machine.user_id().to_owned(),
+                ToDeviceSecretRequestEventContent::new(
+                    RequestAction::Request(SecretRequestAction::new(SecretName::RecoveryKey)),
+                    bob_machine.device_id().to_owned(),
+                    request_id.clone(),
+                ),
+            );
+            alice_machine.inner.key_request_machine.receive_incoming_secret_request(&event);
+            let alice_cache = alice_machine.store().cache().await.unwrap();
+            alice_machine
+                .inner
+                .key_request_machine
+                .collect_incoming_key_requests(&alice_cache)
+                .await
+                .unwrap();
+
+            let requests = alice_machine
+                .inner
+                .key_request_machine
+                .outgoing_to_device_requests()
+                .await
+                .unwrap();
+            let request = requests.first().expect("Alice answers");
+            let event: EncryptedToDeviceEvent =
+                request_to_event(bob_machine.user_id(), alice_machine.user_id(), request);
+            let event = Raw::from_json(to_raw_value(&event).unwrap());
+            alice_machine
+                .inner
+                .key_request_machine
+                .mark_outgoing_request_as_sent(&request.request_id)
+                .await
+                .unwrap();
+
+            let stream = bob_machine.store().secrets_stream();
+            pin_mut!(stream);
+            bob_machine
+                .receive_sync_changes(
+                    EncryptionSyncChanges {
+                        to_device_events: vec![event],
+                        changed_devices: &Default::default(),
+                        one_time_keys_counts: &Default::default(),
+                        unused_fallback_keys: None,
+                        next_batch_token: None,
+                    },
+                    &DecryptionSettings {
+                        sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        refuse_legacy_from_unsigned_known_devices: false,
+                    },
+                )
+                .await
+                .unwrap();
+            stream.next().now_or_never().flatten().is_some()
+        };
+
+        // Alice serves, as an own device with no list in force does.
+        assert!(!answer().await, "Bob has no list that names Alice or itself yet");
+        assert!(sent_out().await, "the request is still marked as sent, nothing asks again");
+        assert!(
+            bob_machine
+                .inner
+                .key_request_machine
+                .outgoing_to_device_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The list that names Bob and Alice is accepted.
+        bob_machine
+            .sign_own_device_list(
+                1,
+                std::collections::BTreeMap::from([
+                    (bob_machine.device_id().to_owned(), bob_machine.identity_keys().ed25519),
+                    (alice_machine.device_id().to_owned(), alice_machine.identity_keys().ed25519),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert!(!sent_out().await);
+        let queued =
+            bob_machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap();
+        assert_eq!(queued.len(), 1);
+
+        // The next answer is taken.
+        assert!(answer().await, "Bob takes the answer to the request that went out again");
+    }
+
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_key_share_cycle_without_session() {

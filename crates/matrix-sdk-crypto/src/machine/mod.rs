@@ -2193,6 +2193,14 @@ impl OlmMachine {
     /// inbox (a recovery key that arrived before the flag was set), so that
     /// nothing can later enable backups with it.
     ///
+    /// This does **not** delete a backup decryption key (and version) that was
+    /// already stored on the device, for example when an own device is demoted.
+    /// Such a key is not used to upload, resume or enable the backup on a
+    /// restricted device, and `matrix-sdk` does not download from the backup
+    /// with it, but it remains in the crypto store until the user resets or
+    /// signs out. An application that must not keep it should delete the
+    /// device's store.
+    ///
     /// Lifting the restriction (`restricted == false`) is only meaningful once
     /// the device holds the secrets itself, for example because the user
     /// entered the recovery key on it.

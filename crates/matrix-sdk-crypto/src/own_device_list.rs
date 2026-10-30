@@ -57,7 +57,7 @@ use std::collections::BTreeMap;
 
 use ruma::{DeviceId, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use vodozemac::Ed25519PublicKey;
 
 use crate::{
@@ -447,6 +447,11 @@ impl Store {
         let current = self.load_own_device_list_state().await?;
         let floor = self.own_device_list_version_floor().await?;
         let evaluation = self.evaluate_own_device_list(current.as_ref(), candidate).await?;
+        let required = self.own_device_list_required().await?;
+        let candidate_key = match &evaluation {
+            Evaluation::Valid { self_signing_key, .. } => Some(self_signing_key.clone()),
+            _ => None,
+        };
 
         let (outcome, new_state) = match (evaluation, candidate) {
             (Evaluation::Valid { self_signing_key, anchored }, Some(list)) => Self::decide(
@@ -476,13 +481,59 @@ impl Store {
             })
         });
 
-        if let Some(new_state) = new_state
-            && current.as_ref() != Some(&new_state)
+        if let Some(new_state) = &new_state
+            && current.as_ref() != Some(new_state)
         {
-            self.store_own_device_list_state(&new_state).await?;
+            self.store_own_device_list_state(new_state).await?;
+        }
+
+        // A device that did not serve (and so dropped the answers it was sent)
+        // and now does: ask for the secrets again, because the answers that
+        // came before the list are gone and the requests are marked as sent.
+        // To-device events of a sync are processed before the application
+        // passes this device the list from the same sync, so this is the usual
+        // order for a device that was just approved.
+        if let (Some(new_state), Some(key)) = (&new_state, &candidate_key) {
+            let served_before = match &current {
+                Some(state) => state.serving && &state.self_signing_key == key,
+                None => !required,
+            };
+            if new_state.serving && &new_state.self_signing_key == key && !served_before {
+                self.requeue_secret_requests().await?;
+            }
         }
 
         Ok(outcome)
+    }
+
+    /// Mark the secret requests that were sent, and not yet answered, as
+    /// unsent, so that they go out again with the same request ids.
+    ///
+    /// Room key requests are not touched: the store can not list them, and a
+    /// new decryption failure asks again.
+    async fn requeue_secret_requests(&self) -> Result<()> {
+        // A restricted device asks for nothing.
+        if self.is_device_restricted().await? {
+            return Ok(());
+        }
+
+        let mut changes = crate::store::types::Changes::default();
+        for name in crate::machine::KNOWN_SECRET_NAMES {
+            let info = crate::SecretInfo::SecretRequest(name);
+            if let Some(mut request) = self.get_secret_request_by_info(&info).await?
+                && request.sent_out
+            {
+                debug!(?info, "Asking for a secret again, the own-device list now names us");
+                request.sent_out = false;
+                changes.key_requests.push(request);
+            }
+        }
+
+        if !changes.key_requests.is_empty() {
+            self.save_changes(changes).await?;
+        }
+
+        Ok(())
     }
 
     /// Decide what a candidate that verified does to the remembered state.
@@ -667,7 +718,7 @@ mod tests {
 
     use assert_matches2::assert_matches;
     use matrix_sdk_test::async_test;
-    use ruma::{DeviceId, OwnedDeviceId, device_id, user_id};
+    use ruma::{DeviceId, OwnedDeviceId, device_id, events::secret::request::SecretName, user_id};
     use serde_json::json;
     use vodozemac::Ed25519PublicKey;
 
@@ -1634,5 +1685,123 @@ mod tests {
         // And with no list at all nothing changes.
         let other = own_machine().await;
         identity(&other).await.verify().await.unwrap();
+    }
+
+    /// Store a secret request for the recovery key that was sent out and not
+    /// answered.
+    async fn sent_recovery_key_request(machine: &OlmMachine) {
+        let mut requests = crate::gossiping::GossipMachine::request_missing_secrets(
+            machine.user_id(),
+            vec![SecretName::RecoveryKey],
+        );
+        requests[0].sent_out = true;
+        let changes = crate::store::types::Changes { key_requests: requests, ..Default::default() };
+        machine.store().save_changes(changes).await.unwrap();
+    }
+
+    async fn queued_secret_requests(machine: &OlmMachine) -> usize {
+        machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap().len()
+    }
+
+    async fn recovery_key_request_is_sent(machine: &OlmMachine) -> bool {
+        machine
+            .store()
+            .get_secret_request_by_info(&crate::SecretInfo::SecretRequest(SecretName::RecoveryKey))
+            .await
+            .unwrap()
+            .expect("the request is stored")
+            .sent_out
+    }
+
+    #[async_test]
+    async fn test_a_device_that_starts_serving_asks_for_its_secrets_again() {
+        let machine = own_machine().await;
+        machine.set_own_device_list_required(true).await.unwrap();
+        sent_recovery_key_request(&machine).await;
+
+        // The answers that came before a list named this device were dropped;
+        // the request stays marked as sent.
+        let before = sign_only(&machine, 1, set(&machine, &[B(), C()])).await;
+        assert_eq!(
+            machine.receive_own_device_list(Some(&before)).await.unwrap(),
+            OwnDeviceListOutcome::ThisDeviceNotListed
+        );
+        assert!(recovery_key_request_is_sent(&machine).await);
+        assert!(queued_secret_requests(&machine).await == 0);
+
+        // The list that names it: the request goes out again.
+        let after = sign_only(&machine, 2, set(&machine, &[A(), B()])).await;
+        assert_eq!(
+            machine.receive_own_device_list(Some(&after)).await.unwrap(),
+            OwnDeviceListOutcome::Accepted { version: 2 }
+        );
+        assert!(!recovery_key_request_is_sent(&machine).await);
+        assert_eq!(queued_secret_requests(&machine).await, 1);
+    }
+
+    #[async_test]
+    async fn test_the_first_list_under_enforcement_asks_for_the_secrets_again() {
+        // No state at all, but enforcing: nothing was served or accepted.
+        let machine = own_machine().await;
+        machine.set_own_device_list_required(true).await.unwrap();
+        sent_recovery_key_request(&machine).await;
+
+        let list = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
+        machine.receive_own_device_list(Some(&list)).await.unwrap();
+
+        assert!(!recovery_key_request_is_sent(&machine).await);
+    }
+
+    #[async_test]
+    async fn test_a_device_that_already_serves_does_not_ask_again() {
+        let machine = own_machine().await;
+        machine.sign_own_device_list(1, set(&machine, &[A(), B()])).await.unwrap();
+        sent_recovery_key_request(&machine).await;
+
+        // serving -> serving
+        let next = sign_only(&machine, 2, set(&machine, &[A(), B(), C()])).await;
+        assert_eq!(
+            machine.receive_own_device_list(Some(&next)).await.unwrap(),
+            OwnDeviceListOutcome::Accepted { version: 2 }
+        );
+        assert!(recovery_key_request_is_sent(&machine).await);
+    }
+
+    #[async_test]
+    async fn test_the_first_list_without_enforcement_does_not_ask_again() {
+        // Not enforcing and no state: the device took every answer already.
+        let machine = own_machine().await;
+        sent_recovery_key_request(&machine).await;
+
+        let list = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
+        machine.receive_own_device_list(Some(&list)).await.unwrap();
+
+        assert!(recovery_key_request_is_sent(&machine).await);
+    }
+
+    #[async_test]
+    async fn test_an_answered_request_is_not_asked_again() {
+        let machine = own_machine().await;
+        machine.set_own_device_list_required(true).await.unwrap();
+
+        // An answered request is deleted, so there is nothing to send again.
+        let list = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
+        machine.receive_own_device_list(Some(&list)).await.unwrap();
+
+        assert!(queued_secret_requests(&machine).await == 0);
+    }
+
+    #[async_test]
+    async fn test_a_restricted_device_does_not_ask_for_secrets_again() {
+        let machine = own_machine().await;
+        machine.set_own_device_list_required(true).await.unwrap();
+        machine.set_device_restricted(true).await.unwrap();
+        // A request that got stored after the flag was set, say in a race.
+        sent_recovery_key_request(&machine).await;
+
+        let list = sign_only(&machine, 1, set(&machine, &[A(), B()])).await;
+        machine.receive_own_device_list(Some(&list)).await.unwrap();
+
+        assert!(recovery_key_request_is_sent(&machine).await);
     }
 }
