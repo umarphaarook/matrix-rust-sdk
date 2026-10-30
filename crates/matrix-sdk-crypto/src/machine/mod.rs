@@ -74,7 +74,8 @@ use crate::session_manager::split_devices_for_share_strategy;
 use crate::x509::{RawX509Signer, RawX509Verifier, X509Signer, X509Verifier};
 use crate::{
     CollectStrategy, CryptoStoreError, DecryptionSettings, DeviceData, LocalTrust,
-    RoomEventDecryptionResult, SignatureError, TrustRequirement,
+    OwnDeviceListOutcome, OwnDeviceListStatus, RoomEventDecryptionResult, SignatureError,
+    TrustRequirement,
     backups::{BackupMachine, MegolmV1BackupKey},
     dehydrated_devices::{DehydratedDevices, DehydrationError},
     error::{EventError, MegolmError, MegolmResult, OlmError, OlmResult, SetRoomSettingsError},
@@ -2189,6 +2190,29 @@ impl OlmMachine {
     /// See [`OlmMachine::set_device_restricted`].
     pub async fn is_device_restricted(&self) -> StoreResult<bool> {
         self.store().is_device_restricted().await
+    }
+
+    /// Process the list of this user's own devices as the application last
+    /// read it from account data, and remember it.
+    ///
+    /// Call this on every sync, with `None` when the list is missing. A device
+    /// that has accepted a valid list from here on hands the account's secrets
+    /// and older message keys only to devices on it, and stops handing them
+    /// out when the list it was last given is missing or invalid. A device
+    /// that never receives a valid list serves as before.
+    ///
+    /// The list is checked against the self-signing key of this user's own
+    /// identity, which must be verified.
+    pub async fn receive_own_device_list(
+        &self,
+        list: Option<&OwnDeviceList>,
+    ) -> StoreResult<OwnDeviceListOutcome> {
+        self.store().receive_own_device_list(list).await
+    }
+
+    /// The own-device list this device serves from, if it has accepted one.
+    pub async fn own_device_list_status(&self) -> StoreResult<Option<OwnDeviceListStatus>> {
+        self.store().own_device_list_status().await
     }
 
     /// Sign a list of this user's own devices with the self-signing key.

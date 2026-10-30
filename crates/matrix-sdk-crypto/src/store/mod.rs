@@ -494,6 +494,10 @@ struct StoreInner {
 
     verification_machine: VerificationMachine,
 
+    /// Serialises read-modify-write updates of the remembered own-device
+    /// list, so two concurrent updates can not lower the remembered version.
+    own_device_list_lock: Mutex<()>,
+
     /// If we can verify peoples' identities via X.509 certificates, a handle to
     /// the implementation.
     #[cfg(feature = "experimental-x509-identity-verification")]
@@ -594,6 +598,7 @@ impl Store {
                 identity,
                 store: store.clone(),
                 verification_machine,
+                own_device_list_lock: Default::default(),
                 #[cfg(feature = "experimental-x509-identity-verification")]
                 x509_verifier,
                 #[cfg(feature = "experimental-x509-identity-verification")]
@@ -606,6 +611,11 @@ impl Store {
                 })),
             }),
         }
+    }
+
+    /// The lock that serialises updates of the remembered own-device list.
+    pub(crate) fn own_device_list_lock(&self) -> &Mutex<()> {
+        &self.inner.own_device_list_lock
     }
 
     /// UserId associated with this store

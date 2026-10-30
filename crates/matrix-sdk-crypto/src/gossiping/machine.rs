@@ -319,6 +319,15 @@ impl GossipMachine {
 
         for device in devices.devices() {
             if !device.is_our_own_device() && device.is_verified() {
+                if !self.inner.store.own_device_list_permits(device.device_id()).await {
+                    info!(
+                        ?secret_name,
+                        device_id = ?device.device_id(),
+                        "Not pushing a secret, the device isn't on the own-device list",
+                    );
+                    continue;
+                }
+
                 let event_type = content.event_type().to_owned();
                 match device.encrypt(&event_type, content.clone()).await {
                     Ok((_used_session, content, message_id)) => {
@@ -422,6 +431,18 @@ impl GossipMachine {
         if let Some(device) = device {
             if device.user_id() == self.user_id() {
                 if device.is_verified() {
+                    if !self.inner.store.own_device_list_permits(device.device_id()).await {
+                        info!(
+                            user_id = ?device.user_id(),
+                            device_id = ?device.device_id(),
+                            ?secret_name,
+                            "Received a secret request that we won't serve, \
+                            the device isn't on the own-device list",
+                        );
+
+                        return Ok(None);
+                    }
+
                     info!(
                         user_id = ?device.user_id(),
                         device_id = ?device.device_id(),
@@ -770,9 +791,16 @@ impl GossipMachine {
             .await
             .filter(|outgoing_session| outgoing_session.session_id() == session.session_id());
 
-        // If this is our own, verified device, we share the entire session from the
+        // If this is our own, verified device, and it is on the own-device list
+        // (when we are enforcing one), we share the entire session from the
         // earliest known index.
-        if device.user_id() == self.user_id() && device.is_verified() {
+        //
+        // A device that is verified but not on the list falls through to the
+        // checks below: it gets only what we recorded sharing with it.
+        if device.user_id() == self.user_id()
+            && device.is_verified()
+            && self.inner.store.own_device_list_permits(device.device_id()).await
+        {
             Ok(None)
         // Otherwise, if the records show we previously shared with this device,
         // we'll reshare the session from the index we previously shared
@@ -2819,5 +2847,226 @@ mod tests {
     #[cfg(feature = "experimental-push-secrets")]
     async fn test_restricted_device_drops_a_pushed_secret() {
         assert_eq!(push_backup_key_to_bob(true).await, (false, 0));
+    }
+
+    /// Give `machine` an own identity it holds the private keys of, verified,
+    /// the way an own device that holds the account's secrets has one.
+    async fn setup_own_identity(machine: &GossipMachine) {
+        use crate::OwnUserIdentityData;
+
+        // The helper machine starts with an empty private identity: make real
+        // keys, then publish the matching public identity into the store.
+        machine.inner.store.reset_cross_signing_identity().await;
+        let private = machine.inner.store.private_identity();
+        let public = OwnUserIdentityData::from_private(&*private.lock().await).await;
+        public.mark_as_verified();
+
+        machine
+            .inner
+            .store
+            .save_changes(Changes {
+                identities: crate::store::types::IdentityChanges {
+                    new: vec![public.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Sign a list with `machine`'s self-signing key, and give it to the
+    /// machine, so that it serves only the listed devices.
+    async fn enforce_own_device_list(
+        machine: &GossipMachine,
+        version: u64,
+        devices: &[&DeviceId],
+    ) -> crate::types::OwnDeviceList {
+        let mut list = crate::types::OwnDeviceList::new(
+            machine.user_id().to_owned(),
+            version,
+            devices.iter().map(|d| (*d).to_owned()).collect(),
+        );
+        machine
+            .inner
+            .store
+            .private_identity()
+            .lock()
+            .await
+            .sign_own_device_list(&mut list)
+            .await
+            .unwrap();
+
+        let outcome = machine.inner.store.receive_own_device_list(Some(&list)).await.unwrap();
+        assert_eq!(outcome, crate::OwnDeviceListOutcome::Accepted { version });
+
+        list
+    }
+
+    /// Alice (the machine) is asked for a secret by her other, verified
+    /// device. Returns whether she answers.
+    async fn alice_answers_secret_request(list: Option<&[&DeviceId]>) -> bool {
+        let alice_machine = get_machine_test_helper().await;
+
+        let mut second_account = alice_2_account();
+        let alice_device = DeviceData::from_account(&second_account);
+        alice_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.inner.store.save_device_data(&[alice_device]).await.unwrap();
+
+        let alice_session = alice_machine
+            .inner
+            .store
+            .with_transaction(async |tr| {
+                let alice_account = tr.account().await?;
+                let (alice_session, _) =
+                    alice_account.create_session_for_test_helper(&mut second_account).await;
+                Ok(alice_session)
+            })
+            .await
+            .unwrap();
+        alice_machine.inner.store.save_sessions(&[alice_session]).await.unwrap();
+
+        // This also gives Alice a master key to serve.
+        setup_own_identity(&alice_machine).await;
+        if let Some(devices) = list {
+            enforce_own_device_list(&alice_machine, 1, devices).await;
+        }
+
+        let event = RumaToDeviceEvent::new(
+            alice_id().to_owned(),
+            ToDeviceSecretRequestEventContent::new(
+                RequestAction::Request(SecretRequestAction::new(SecretName::CrossSigningMasterKey)),
+                second_account.device_id().into(),
+                "request_id".into(),
+            ),
+        );
+
+        assert!(alice_machine.inner.outgoing_requests.read().is_empty());
+        alice_machine.receive_incoming_secret_request(&event);
+        {
+            let alice_cache = alice_machine.inner.store.cache().await.unwrap();
+            alice_machine.collect_incoming_key_requests(&alice_cache).await.unwrap();
+        }
+
+        !alice_machine.inner.outgoing_requests.read().is_empty()
+    }
+
+    #[async_test]
+    async fn test_secret_request_without_a_list_is_served_as_before() {
+        assert!(alice_answers_secret_request(None).await);
+    }
+
+    #[async_test]
+    async fn test_secret_request_from_a_device_on_the_list_is_served() {
+        assert!(alice_answers_secret_request(Some(&[alice_device_id(), alice2_device_id()])).await);
+    }
+
+    #[async_test]
+    async fn test_secret_request_from_a_verified_device_off_the_list_is_refused() {
+        // The device is verified, as a confirmed borrowed device is, but the
+        // list names only Alice's own device.
+        assert!(!alice_answers_secret_request(Some(&[alice_device_id()])).await);
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_full_session_is_shared_only_with_devices_on_the_list() {
+        let machine = get_machine_test_helper().await;
+        let account = account();
+        let (outbound, inbound) = account.create_group_session_pair_with_defaults(room_id()).await;
+
+        let own_device =
+            machine.inner.store.get_device(alice_id(), alice2_device_id()).await.unwrap().unwrap();
+        own_device.set_trust_state(LocalTrust::Verified);
+
+        // No list: shared as before.
+        machine.should_share_key(&own_device, &inbound).await.unwrap();
+
+        setup_own_identity(&machine).await;
+
+        // A list that does not name the device: refused, as a device we know
+        // nothing more about.
+        enforce_own_device_list(&machine, 1, &[alice_device_id()]).await;
+        assert_matches!(
+            machine.should_share_key(&own_device, &inbound).await,
+            Err(KeyForwardDecision::UntrustedDevice)
+        );
+
+        // A list that names it: the whole session, from the earliest index.
+        enforce_own_device_list(&machine, 2, &[alice_device_id(), alice2_device_id()]).await;
+        assert_eq!(machine.should_share_key(&own_device, &inbound).await.unwrap(), None);
+
+        // A device that has been removed again gets nothing new...
+        enforce_own_device_list(&machine, 3, &[alice_device_id()]).await;
+        assert_matches!(
+            machine.should_share_key(&own_device, &inbound).await,
+            Err(KeyForwardDecision::UntrustedDevice)
+        );
+
+        // ...except a session we recorded sharing with it, which it has
+        // already seen, from the index we shared at.
+        let mut changes = Changes::default();
+        changes.outbound_group_sessions.push(outbound.clone());
+        changes.inbound_group_sessions.push(inbound.clone());
+        machine.inner.store.save_changes(changes).await.unwrap();
+        machine.inner.outbound_group_sessions.insert(outbound.clone());
+        outbound
+            .mark_shared_with(
+                own_device.user_id(),
+                own_device.device_id(),
+                own_device.curve25519_key().unwrap(),
+            )
+            .await;
+        assert_eq!(machine.should_share_key(&own_device, &inbound).await.unwrap(), Some(0));
+    }
+
+    /// Alice pushes the backup key to her other verified device. Returns
+    /// whether a push was queued.
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn alice_pushes_to_bob(bob_listed: Option<bool>) -> bool {
+        let (alice_machine, _alice_device, bob_machine, bob_device, _decryption_key) =
+            set_up_secret_push().await;
+
+        bob_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+
+        if let Some(listed) = bob_listed {
+            alice_machine.bootstrap_cross_signing(false).await.unwrap();
+            let mut devices =
+                std::collections::BTreeSet::from([alice_machine.device_id().to_owned()]);
+            if listed {
+                devices.insert(bob_machine.device_id().to_owned());
+            }
+            let list = alice_machine.sign_own_device_list(1, devices).await.unwrap();
+            alice_machine.receive_own_device_list(Some(&list)).await.unwrap();
+        }
+
+        alice_machine
+            .inner
+            .key_request_machine
+            .push_secret_to_verified_devices(SecretName::RecoveryKey)
+            .await
+            .unwrap();
+
+        !alice_machine
+            .inner
+            .key_request_machine
+            .outgoing_to_device_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_secret_push_without_a_list_goes_to_verified_devices_as_before() {
+        assert!(alice_pushes_to_bob(None).await);
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_secret_push_goes_only_to_devices_on_the_list() {
+        assert!(alice_pushes_to_bob(Some(true)).await);
+        assert!(!alice_pushes_to_bob(Some(false)).await);
     }
 }
