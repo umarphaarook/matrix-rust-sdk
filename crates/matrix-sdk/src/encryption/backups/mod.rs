@@ -1355,10 +1355,7 @@ mod test {
         // fail with a 404, a different error from the one asserted here.
         let res = client.encryption().backups().create().await;
 
-        assert_matches!(
-            res,
-            Err(Error::SignatureError(matrix_sdk_base::crypto::SignatureError::DeviceRestricted))
-        );
+        assert_matches!(res, Err(Error::SignatureError(SignatureError::DeviceRestricted)));
         assert_eq!(client.encryption().backups().state(), BackupState::Unknown);
     }
 

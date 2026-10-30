@@ -482,6 +482,14 @@ impl BackupMachine {
     pub async fn backup(
         &self,
     ) -> Result<Option<(OwnedTransactionId, KeysBackupRequest)>, CryptoStoreError> {
+        // A restricted device uploads nothing, even when a backup was enabled
+        // before it became restricted. The stored key and the backed-up flags
+        // are left as they are.
+        if self.store.is_device_restricted().await? {
+            trace!("Not backing up, this device is restricted");
+            return Ok(None);
+        }
+
         let mut request = self.pending_backup.write().await;
 
         if let Some(request) = &*request {
@@ -1029,6 +1037,28 @@ mod tests {
     #[async_test]
     async fn test_when_a_list_is_required_a_verified_device_with_no_list_is_not_trusted() {
         assert!(!trusts_backup_signed_by_verified_device(None, true).await);
+    }
+
+    #[async_test]
+    async fn test_a_restricted_device_with_an_enabled_backup_uploads_nothing() {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        let backup_machine = machine.backup_machine();
+
+        machine.create_outbound_group_session_with_defaults_test_helper(room_id()).await.unwrap();
+        let key = BackupDecryptionKey::new().megolm_v1_public_key();
+        key.set_version("1".to_owned());
+        backup_machine.enable_backup_v1(key).await.unwrap();
+
+        // The backup was enabled before the device became restricted.
+        machine.set_device_restricted(true).await.unwrap();
+        assert!(backup_machine.backup().await.unwrap().is_none());
+
+        let counts = backup_machine.store.inbound_group_session_counts(Some("1")).await.unwrap();
+        assert_eq!((counts.total, counts.backed_up), (1, 0), "no flag was touched");
+
+        // Control: without the restriction the room key is uploaded.
+        machine.set_device_restricted(false).await.unwrap();
+        assert!(backup_machine.backup().await.unwrap().is_some());
     }
 
     #[async_test]

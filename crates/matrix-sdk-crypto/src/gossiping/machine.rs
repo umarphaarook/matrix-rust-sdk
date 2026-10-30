@@ -2503,44 +2503,41 @@ mod tests {
             .unwrap();
 
         // Alice answers the request, and Bob receives the answer.
-        let answer = || async {
+        let (alice_ref, bob_ref) = (&alice_machine, &bob_machine);
+        let answer = |request_id: ruma::OwnedTransactionId| async move {
             let event = RumaToDeviceEvent::new(
-                alice_machine.user_id().to_owned(),
+                alice_ref.user_id().to_owned(),
                 ToDeviceSecretRequestEventContent::new(
                     RequestAction::Request(SecretRequestAction::new(SecretName::RecoveryKey)),
-                    bob_machine.device_id().to_owned(),
-                    request_id.clone(),
+                    bob_ref.device_id().to_owned(),
+                    request_id,
                 ),
             );
-            alice_machine.inner.key_request_machine.receive_incoming_secret_request(&event);
-            let alice_cache = alice_machine.store().cache().await.unwrap();
-            alice_machine
+            alice_ref.inner.key_request_machine.receive_incoming_secret_request(&event);
+            let alice_cache = alice_ref.store().cache().await.unwrap();
+            alice_ref
                 .inner
                 .key_request_machine
                 .collect_incoming_key_requests(&alice_cache)
                 .await
                 .unwrap();
 
-            let requests = alice_machine
-                .inner
-                .key_request_machine
-                .outgoing_to_device_requests()
-                .await
-                .unwrap();
+            let requests =
+                alice_ref.inner.key_request_machine.outgoing_to_device_requests().await.unwrap();
             let request = requests.first().expect("Alice answers");
             let event: EncryptedToDeviceEvent =
-                request_to_event(bob_machine.user_id(), alice_machine.user_id(), request);
+                request_to_event(bob_ref.user_id(), alice_ref.user_id(), request);
             let event = Raw::from_json(to_raw_value(&event).unwrap());
-            alice_machine
+            alice_ref
                 .inner
                 .key_request_machine
                 .mark_outgoing_request_as_sent(&request.request_id)
                 .await
                 .unwrap();
 
-            let stream = bob_machine.store().secrets_stream();
+            let stream = bob_ref.store().secrets_stream();
             pin_mut!(stream);
-            bob_machine
+            bob_ref
                 .receive_sync_changes(
                     EncryptionSyncChanges {
                         to_device_events: vec![event],
@@ -2560,7 +2557,7 @@ mod tests {
         };
 
         // Alice serves, as an own device with no list in force does.
-        assert!(!answer().await, "Bob has no list that names Alice or itself yet");
+        assert!(!answer(request_id.clone()).await, "Bob has no list that names Alice yet");
         assert!(sent_out().await, "the request is still marked as sent, nothing asks again");
         assert!(
             bob_machine
@@ -2588,8 +2585,38 @@ mod tests {
             bob_machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap();
         assert_eq!(queued.len(), 1);
 
-        // The next answer is taken.
-        assert!(answer().await, "Bob takes the answer to the request that went out again");
+        // The request goes out under a new id: the id is the transaction id of
+        // the `sendToDevice` call, which a homeserver answers from its cache
+        // when it sees it again.
+        let new_request_id = queued[0].request_id.clone();
+        assert_ne!(new_request_id, request_id);
+        let stored = bob_machine
+            .store()
+            .get_secret_request_by_info(&crate::SecretInfo::SecretRequest(SecretName::RecoveryKey))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.request_id, new_request_id);
+        assert!(
+            bob_machine.store().get_outgoing_secret_requests(&request_id).await.unwrap().is_none()
+        );
+
+        // A late answer to the old id is dropped, and the new request waits.
+        assert!(!answer(request_id).await, "an answer to the old request id is dropped");
+        assert!(
+            bob_machine
+                .store()
+                .get_outgoing_secret_requests(&new_request_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The answer to the new request is taken.
+        assert!(
+            answer(new_request_id).await,
+            "Bob takes the answer to the request that went out again"
+        );
     }
 
     #[async_test]

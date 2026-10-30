@@ -481,18 +481,16 @@ impl Store {
             })
         });
 
-        if let Some(new_state) = &new_state
-            && current.as_ref() != Some(new_state)
-        {
-            self.store_own_device_list_state(new_state).await?;
-        }
-
         // A device that did not serve (and so dropped the answers it was sent)
         // and now does: ask for the secrets again, because the answers that
         // came before the list are gone and the requests are marked as sent.
         // To-device events of a sync are processed before the application
         // passes this device the list from the same sync, so this is the usual
         // order for a device that was just approved.
+        //
+        // This runs before the state is stored: if it fails, the state still
+        // says "not serving" and the next list tries again, instead of a
+        // serving state with nothing asked for.
         if let (Some(new_state), Some(key)) = (&new_state, &candidate_key) {
             let served_before = match &current {
                 Some(state) => state.serving && &state.self_signing_key == key,
@@ -503,34 +501,61 @@ impl Store {
             }
         }
 
+        if let Some(new_state) = &new_state
+            && current.as_ref() != Some(new_state)
+        {
+            self.store_own_device_list_state(new_state).await?;
+        }
+
         Ok(outcome)
     }
 
-    /// Mark the secret requests that were sent, and not yet answered, as
-    /// unsent, so that they go out again with the same request ids.
+    /// Ask again for the secrets that were requested and not answered, under
+    /// new request ids.
     ///
-    /// Room key requests are not touched: the store can not list them, and a
-    /// new decryption failure asks again.
+    /// The request id is also the transaction id of the `sendToDevice` call,
+    /// and a homeserver answers a repeated transaction id from its cache for
+    /// a while without delivering the event again. So the stored request is
+    /// replaced by a new one (the same secret, a fresh id) instead of being
+    /// marked as unsent. A late answer to the old id finds no request and is
+    /// dropped.
+    ///
+    /// This re-asks for exactly what was asked before, which is what is still
+    /// missing: a request is deleted when its secret is answered. The new
+    /// request is saved before the old one is deleted, so a failure in between
+    /// leaves two requests rather than none.
+    ///
+    /// Room key requests are not touched: the store can not list them. A new
+    /// decryption failure does not ask again while a request for that session
+    /// exists, so a forwarded key that was dropped stays missing (where
+    /// forwarding is enabled) until the request is cleared.
     async fn requeue_secret_requests(&self) -> Result<()> {
         // A restricted device asks for nothing.
         if self.is_device_restricted().await? {
             return Ok(());
         }
 
+        let mut replaced = Vec::new();
         let mut changes = crate::store::types::Changes::default();
         for name in crate::machine::KNOWN_SECRET_NAMES {
-            let info = crate::SecretInfo::SecretRequest(name);
-            if let Some(mut request) = self.get_secret_request_by_info(&info).await?
+            let info = crate::SecretInfo::SecretRequest(name.clone());
+            if let Some(request) = self.get_secret_request_by_info(&info).await?
                 && request.sent_out
             {
                 debug!(?info, "Asking for a secret again, the own-device list now names us");
-                request.sent_out = false;
-                changes.key_requests.push(request);
+                changes.key_requests.push(crate::gossiping::GossipRequest::from_secret_name(
+                    request.request_recipient.clone(),
+                    name,
+                ));
+                replaced.push(request.request_id);
             }
         }
 
         if !changes.key_requests.is_empty() {
             self.save_changes(changes).await?;
+        }
+        for old_id in replaced {
+            self.delete_outgoing_secret_requests(&old_id).await?;
         }
 
         Ok(())
@@ -1703,6 +1728,16 @@ mod tests {
         machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap().len()
     }
 
+    async fn recovery_key_request_id(machine: &OlmMachine) -> ruma::OwnedTransactionId {
+        machine
+            .store()
+            .get_secret_request_by_info(&crate::SecretInfo::SecretRequest(SecretName::RecoveryKey))
+            .await
+            .unwrap()
+            .expect("the request is stored")
+            .request_id
+    }
+
     async fn recovery_key_request_is_sent(machine: &OlmMachine) -> bool {
         machine
             .store()
@@ -1730,6 +1765,7 @@ mod tests {
         assert!(queued_secret_requests(&machine).await == 0);
 
         // The list that names it: the request goes out again.
+        let old_id = recovery_key_request_id(&machine).await;
         let after = sign_only(&machine, 2, set(&machine, &[A(), B()])).await;
         assert_eq!(
             machine.receive_own_device_list(Some(&after)).await.unwrap(),
@@ -1737,6 +1773,10 @@ mod tests {
         );
         assert!(!recovery_key_request_is_sent(&machine).await);
         assert_eq!(queued_secret_requests(&machine).await, 1);
+
+        // Under a new id, and the old request is gone.
+        assert_ne!(recovery_key_request_id(&machine).await, old_id);
+        assert!(machine.store().get_outgoing_secret_requests(&old_id).await.unwrap().is_none());
     }
 
     #[async_test]
