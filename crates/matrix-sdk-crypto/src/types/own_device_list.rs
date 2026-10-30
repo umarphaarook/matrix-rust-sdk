@@ -24,10 +24,11 @@
 //! verification. Where the list is stored on the server, and when a device
 //! decides to trust or serve from it, are decided elsewhere.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
+use vodozemac::Ed25519PublicKey;
 
 use super::{Signatures, cross_signing::SelfSigningPubkey};
 use crate::{error::SignatureError, olm::SignedJsonObject, store::CryptoStoreError};
@@ -35,6 +36,43 @@ use crate::{error::SignatureError, olm::SignedJsonObject, store::CryptoStoreErro
 /// The largest version that survives canonical JSON, which only carries
 /// integers up to 2^53 - 1.
 const MAX_VERSION: u64 = (1 << 53) - 1;
+
+/// Serde for the device map: the keys are written as unpadded base64 strings,
+/// which is also what the canonical JSON the signature covers contains.
+mod key_map {
+    use std::collections::BTreeMap;
+
+    use ruma::OwnedDeviceId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use vodozemac::Ed25519PublicKey;
+
+    pub fn serialize<S: Serializer>(
+        devices: &BTreeMap<OwnedDeviceId, Ed25519PublicKey>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        devices
+            .iter()
+            .map(|(id, key)| (id, key.to_base64()))
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<OwnedDeviceId, Ed25519PublicKey>, D::Error> {
+        BTreeMap::<OwnedDeviceId, String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(id, key)| {
+                Ed25519PublicKey::from_base64(&key).map(|key| (id, key)).map_err(D::Error::custom)
+            })
+            .collect()
+    }
+}
+
+/// The version of the list's signed format. It is part of the signed content,
+/// and a device refuses any other value, so a change of format is a lockstep
+/// upgrade that fails closed on devices that have not made it.
+pub const OWN_DEVICE_LIST_FORMAT: u32 = 1;
 
 /// The role marker inside the signed content.
 ///
@@ -54,22 +92,27 @@ enum Purpose {
 /// ```json
 /// {
 ///   "purpose": "own_device_list",
+///   "format": 1,
 ///   "user_id": "@alice:example.org",
 ///   "version": 3,
-///   "devices": ["ABCDEFGH", "IJKLMNOP"],
+///   "devices": { "ABCDEFGH": "<ed25519 key>", "IJKLMNOP": "<ed25519 key>" },
 ///   "signatures": { "@alice:example.org": { "ed25519:<self-signing key>": "..." } }
 /// }
 /// ```
 ///
-/// `devices` is a set, so it has a single canonical order, and everything
-/// except `signatures` (and `unsigned`, which is not kept) is covered by the
-/// signature.
+/// `devices` maps each own device's ID to its Ed25519 identity key. A device
+/// is on the list only if both match: a device ID alone proves nothing, since
+/// a new device can be given the ID of a deleted one. The map has a single
+/// canonical order, and everything except `signatures` (and `unsigned`, which
+/// is not kept) is covered by the signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnDeviceList {
     purpose: Purpose,
+    format: u32,
     user_id: OwnedUserId,
     version: u64,
-    devices: BTreeSet<OwnedDeviceId>,
+    #[serde(with = "key_map")]
+    devices: BTreeMap<OwnedDeviceId, Ed25519PublicKey>,
     #[serde(default)]
     signatures: Signatures,
 }
@@ -82,10 +125,11 @@ impl OwnDeviceList {
     pub(crate) fn new(
         user_id: OwnedUserId,
         version: u64,
-        devices: BTreeSet<OwnedDeviceId>,
+        devices: BTreeMap<OwnedDeviceId, Ed25519PublicKey>,
     ) -> Self {
         Self {
             purpose: Purpose::OwnDeviceList,
+            format: OWN_DEVICE_LIST_FORMAT,
             user_id,
             version,
             devices,
@@ -103,16 +147,16 @@ impl OwnDeviceList {
         self.version
     }
 
-    /// The devices on the list.
-    pub fn devices(&self) -> &BTreeSet<OwnedDeviceId> {
+    /// The devices on the list, with their Ed25519 identity keys.
+    pub fn devices(&self) -> &BTreeMap<OwnedDeviceId, Ed25519PublicKey> {
         &self.devices
     }
 
-    /// Is the given device on the list?
+    /// Is a device with this ID and this Ed25519 key on the list?
     ///
     /// This says nothing about whether the list itself is valid.
-    pub fn contains(&self, device_id: &DeviceId) -> bool {
-        self.devices.contains(device_id)
+    pub fn contains(&self, device_id: &DeviceId, ed25519_key: &Ed25519PublicKey) -> bool {
+        self.devices.get(device_id) == Some(ed25519_key)
     }
 
     /// The signatures on the list.
@@ -130,6 +174,10 @@ impl OwnDeviceList {
     /// The caller decides which key to trust; for a device that serves secrets
     /// that is the self-signing key of its own, verified, user identity.
     pub fn verify(&self, self_signing_key: &SelfSigningPubkey) -> Result<(), OwnDeviceListError> {
+        if self.format != OWN_DEVICE_LIST_FORMAT {
+            return Err(OwnDeviceListError::UnsupportedFormat(self.format));
+        }
+
         if self.version == 0 || self.version > MAX_VERSION {
             return Err(OwnDeviceListError::InvalidVersion(self.version));
         }
@@ -158,6 +206,10 @@ pub enum OwnDeviceListError {
     #[error("the own-device list belongs to a different user")]
     WrongUser,
 
+    /// The list is in a format this device does not know.
+    #[error("the own-device list format {0} is not supported")]
+    UnsupportedFormat(u32),
+
     /// The version is zero, or too large to be signed.
     #[error("the own-device list version {0} is not valid")]
     InvalidVersion(u64),
@@ -183,6 +235,17 @@ pub enum OwnDeviceListError {
         requested: u64,
     },
 
+    /// A list was signed but this device does not accept it as its own, so
+    /// signing it would leave this device out of step with the list it
+    /// published.
+    #[error("the signed own-device list was not accepted: {0:?}")]
+    NotAccepted(crate::OwnDeviceListOutcome),
+
+    /// This device does not hold the private keys of the current cross-signing
+    /// identity.
+    #[error("this device does not hold the account's current cross-signing secrets")]
+    SecretsNotHeld,
+
     /// This device has no own user identity to check the list against.
     #[error("there is no own user identity to check the own-device list against")]
     NoOwnIdentity,
@@ -193,13 +256,13 @@ pub enum OwnDeviceListError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
 
     use matrix_sdk_test::async_test;
     use ruma::{OwnedDeviceId, device_id, user_id};
     use serde_json::json;
-    use vodozemac::Ed25519SecretKey;
+    use vodozemac::{Ed25519PublicKey, Ed25519SecretKey};
 
     use super::{OwnDeviceList, OwnDeviceListError};
     use crate::{
@@ -209,8 +272,18 @@ mod tests {
         types::SelfSigningPubkey,
     };
 
-    fn devices(ids: &[&str]) -> BTreeSet<OwnedDeviceId> {
-        ids.iter().map(|id| OwnedDeviceId::from(*id)).collect()
+    /// A deterministic Ed25519 key for a made-up device ID, so that tests can
+    /// say "the same device" and "another device with the same ID".
+    pub(crate) fn key(id: &str) -> Ed25519PublicKey {
+        let mut seed = [0u8; 32];
+        for (i, byte) in id.bytes().enumerate() {
+            seed[i % 32] ^= byte.wrapping_add(i as u8);
+        }
+        Ed25519SecretKey::from_slice(&seed).public_key()
+    }
+
+    pub(crate) fn devices(ids: &[&str]) -> BTreeMap<OwnedDeviceId, Ed25519PublicKey> {
+        ids.iter().map(|id| (OwnedDeviceId::from(*id), key(id))).collect()
     }
 
     /// A fresh own identity: the private keys (what an own device holds) and
@@ -239,9 +312,13 @@ mod tests {
 
         list.verify(&public).unwrap();
         assert_eq!(list.version(), 3);
-        assert!(list.contains(device_id!("A")));
-        assert!(list.contains(device_id!("B")));
-        assert!(!list.contains(device_id!("C")));
+        assert!(list.contains(device_id!("A"), &key("A")));
+        assert!(list.contains(device_id!("B"), &key("B")));
+        assert!(!list.contains(device_id!("C"), &key("C")));
+
+        // The ID alone is not enough: the key has to be the one that was signed.
+        assert!(!list.contains(device_id!("A"), &key("B")));
+        assert!(!list.contains(device_id!("A"), &Ed25519SecretKey::new().public_key()));
     }
 
     #[async_test]
@@ -253,7 +330,11 @@ mod tests {
         let one = signed(&private, 3, &["B", "A"]).await;
         let two = signed(&private, 3, &["A", "B"]).await;
 
-        let expected = r#"{"devices":["A","B"],"purpose":"own_device_list","user_id":"@alice:example.org","version":3}"#;
+        let expected = format!(
+            r#"{{"devices":{{"A":"{}","B":"{}"}},"format":1,"purpose":"own_device_list","user_id":"@alice:example.org","version":3}}"#,
+            key("A").to_base64(),
+            key("B").to_base64(),
+        );
         assert_eq!(one.to_canonical_json().unwrap(), expected);
         assert_eq!(two.to_canonical_json().unwrap(), expected);
     }
@@ -265,7 +346,8 @@ mod tests {
 
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["purpose"], "own_device_list");
-        assert_eq!(json["devices"], json!(["A"]));
+        assert_eq!(json["devices"], json!({ "A": key("A").to_base64() }));
+        assert_eq!(json["format"], 1);
 
         let parsed: OwnDeviceList = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, list);
@@ -280,13 +362,24 @@ mod tests {
 
         // A server or a borrowed device that edits any signed field.
         let mut with_extra_device = json.clone();
-        with_extra_device["devices"] = json!(["A", "BORROWED"]);
+        with_extra_device["devices"] =
+            json!({ "A": key("A").to_base64(), "BORROWED": key("BORROWED").to_base64() });
+        let mut with_swapped_key = json.clone();
+        with_swapped_key["devices"] = json!({ "A": key("BORROWED").to_base64() });
+        let mut with_other_format = json.clone();
+        with_other_format["format"] = json!(2);
         let mut with_higher_version = json.clone();
         with_higher_version["version"] = json!(99);
         let mut for_other_user = json;
         for_other_user["user_id"] = json!("@mallory:example.org");
 
-        for forged in [with_extra_device, with_higher_version, for_other_user] {
+        for forged in [
+            with_extra_device,
+            with_swapped_key,
+            with_other_format,
+            with_higher_version,
+            for_other_user,
+        ] {
             let forged: OwnDeviceList = serde_json::from_value(forged).unwrap();
             assert!(forged.verify(&public).is_err(), "a forged list verified: {forged:?}");
         }
@@ -399,8 +492,8 @@ mod tests {
         // The role marker must be present and exact, so the self-signing key's
         // signature over device keys can never be read as a list.
         for json in [
-            json!({"user_id": "@alice:example.org", "version": 1, "devices": []}),
-            json!({"purpose": "device", "user_id": "@alice:example.org", "version": 1, "devices": []}),
+            json!({"format": 1, "user_id": "@alice:example.org", "version": 1, "devices": {}}),
+            json!({"purpose": "device", "format": 1, "user_id": "@alice:example.org", "version": 1, "devices": {}}),
         ] {
             assert!(serde_json::from_value::<OwnDeviceList>(json).is_err());
         }

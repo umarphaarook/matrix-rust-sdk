@@ -195,14 +195,24 @@ impl BackupMachine {
 
     /// Check if the signed JSON payload `auth_data` has been signed by the
     /// `device`.
-    fn backup_signed_by_device(
+    ///
+    /// A verified device's signature is trusted only if the device is also one
+    /// the account's own-device list permits: a borrowed device can be
+    /// verified (it is, to read its owner's messages) without being one of
+    /// the user's own, and it must not be able to make a backup trusted.
+    async fn backup_signed_by_device(
         &self,
         device: Device,
         signatures: &Signatures,
         auth_data: &str,
     ) -> SignatureState {
         if device.has_signed_raw(signatures, auth_data).is_ok() {
-            if device.is_verified() {
+            if device.is_verified()
+                && self
+                    .store
+                    .own_device_list_permits(device.device_id(), device.ed25519_key())
+                    .await
+            {
                 SignatureState::ValidAndTrusted
             } else {
                 SignatureState::ValidButNotTrusted
@@ -264,7 +274,7 @@ impl BackupMachine {
         trace!(?device_id, "Checking backup auth data for device");
 
         if let Some(device) = device {
-            Ok(self.backup_signed_by_device(device, signatures, auth_data))
+            Ok(self.backup_signed_by_device(device, signatures, auth_data).await)
         } else {
             trace!(?device_id, "Device not found, can't check signature");
             Ok(SignatureState::Missing)
@@ -350,6 +360,12 @@ impl BackupMachine {
         backup_info: &mut RoomKeyBackupInfo,
     ) -> Result<(), SignatureError> {
         if let RoomKeyBackupInfo::MegolmBackupV1Curve25519AesSha2(data) = backup_info {
+            // A restricted device vouches for no backup: its signature would
+            // be the first step to making a backup the account's own.
+            if self.store.is_device_restricted().await? {
+                return Err(SignatureError::DeviceRestricted);
+            }
+
             let canonical_json = data.to_canonical_json()?;
 
             let private_identity = self.store.private_identity();
@@ -382,6 +398,13 @@ impl BackupMachine {
     /// [`m.megolm_backup.v1.curve25519-aes-sha2`]:
     /// https://spec.matrix.org/unstable/client-server-api/#backup-algorithm-mmegolm_backupv1curve25519-aes-sha2
     pub async fn enable_backup_v1(&self, key: MegolmV1BackupKey) -> Result<(), CryptoStoreError> {
+        // A restricted device never takes part in the account's key backup,
+        // not even to upload to a backup it was handed the public key of.
+        if self.store.is_device_restricted().await? {
+            warn!("Refusing to activate a backup on a restricted device");
+            return Ok(());
+        }
+
         if key.backup_version().is_some() {
             *self.backup_key.write().await = Some(key.clone());
             info!(backup_key = ?key, "Activated a backup");
@@ -932,5 +955,97 @@ mod tests {
             backup_decryption_key.megolm_v1_public_key().to_base64(),
             "The OlmMachine loaded the wrong backup key."
         );
+    }
+
+    /// Own device `OWNDEVICE` holds the account's secrets and has a verified
+    /// device `BORROWED` that signed a backup. Returns whether `OWNDEVICE`
+    /// trusts that backup.
+    ///
+    /// `list` is `None` for no own-device list, and `Some(on_it)` for a list
+    /// that names `BORROWED` or not.
+    async fn trusts_backup_signed_by_verified_device(list: Option<bool>, required: bool) -> bool {
+        use crate::LocalTrust;
+
+        let own = OlmMachine::new(alice_id(), device_id!("OWNDEVICE")).await;
+        own.bootstrap_cross_signing(false).await.unwrap();
+        let borrowed = OlmMachine::new(alice_id(), device_id!("BORROWED")).await;
+
+        let device =
+            borrowed.get_device(alice_id(), borrowed.device_id(), None).await.unwrap().unwrap();
+        device.set_trust_state(LocalTrust::Verified);
+        own.store().save_device_data(&[device.inner]).await.unwrap();
+
+        if required {
+            own.set_own_device_list_required(true).await.unwrap();
+        }
+        if let Some(on_it) = list {
+            let mut devices =
+                BTreeMap::from([(own.device_id().to_owned(), own.identity_keys().ed25519)]);
+            if on_it {
+                devices.insert(borrowed.device_id().to_owned(), borrowed.identity_keys().ed25519);
+            }
+            own.sign_own_device_list(1, devices).await.unwrap();
+        }
+
+        let mut backup_info = BackupDecryptionKey::new().to_backup_info();
+        borrowed.backup_machine().sign_backup(&mut backup_info).await.unwrap();
+
+        let result = own.backup_machine().verify_backup(backup_info, true).await.unwrap();
+        // Nothing but the borrowed device signed it.
+        assert!(!result.device_signature.trusted());
+        assert!(!result.user_identity_signature.trusted());
+        result.trusted()
+    }
+
+    #[async_test]
+    async fn test_a_verified_device_off_the_list_does_not_make_a_backup_trusted() {
+        // The attack: a borrowed device, verified so it can read, signs a
+        // backup it controls.
+        assert!(!trusts_backup_signed_by_verified_device(Some(false), false).await);
+    }
+
+    #[async_test]
+    async fn test_a_listed_device_makes_a_backup_trusted() {
+        assert!(trusts_backup_signed_by_verified_device(Some(true), false).await);
+    }
+
+    #[async_test]
+    async fn test_with_no_list_a_verified_device_still_makes_a_backup_trusted() {
+        assert!(trusts_backup_signed_by_verified_device(None, false).await);
+    }
+
+    #[async_test]
+    async fn test_when_a_list_is_required_a_verified_device_with_no_list_is_not_trusted() {
+        assert!(!trusts_backup_signed_by_verified_device(None, true).await);
+    }
+
+    #[async_test]
+    async fn test_a_restricted_device_does_not_sign_or_adopt_a_backup() {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        let decryption_key = BackupDecryptionKey::new();
+
+        // Control: an unrestricted device signs, and enables a backup.
+        let mut backup_info = decryption_key.to_backup_info();
+        machine.backup_machine().sign_backup(&mut backup_info).await.unwrap();
+        let key = decryption_key.megolm_v1_public_key();
+        key.set_version("1".to_owned());
+        machine.backup_machine().enable_backup_v1(key.clone()).await.unwrap();
+        assert!(machine.backup_machine().enabled().await);
+        machine.backup_machine().disable_backup().await.unwrap();
+
+        machine.set_device_restricted(true).await.unwrap();
+
+        let mut backup_info = decryption_key.to_backup_info();
+        assert!(matches!(
+            machine.backup_machine().sign_backup(&mut backup_info).await,
+            Err(crate::SignatureError::DeviceRestricted)
+        ));
+        let RoomKeyBackupInfo::MegolmBackupV1Curve25519AesSha2(data) = &backup_info else {
+            panic!("wrong algorithm");
+        };
+        assert!(data.signatures.is_empty());
+
+        machine.backup_machine().enable_backup_v1(key).await.unwrap();
+        assert!(!machine.backup_machine().enabled().await);
     }
 }

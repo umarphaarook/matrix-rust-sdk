@@ -187,8 +187,10 @@ mod tests {
         (own, borrowed)
     }
 
-    fn device_set(ids: &[&str]) -> std::collections::BTreeSet<ruma::OwnedDeviceId> {
-        ids.iter().map(|id| ruma::OwnedDeviceId::from(*id)).collect()
+    fn device_set(
+        ids: &[&str],
+    ) -> std::collections::BTreeMap<ruma::OwnedDeviceId, vodozemac::Ed25519PublicKey> {
+        crate::types::own_device_list::tests::devices(ids)
     }
 
     #[async_test]
@@ -201,7 +203,7 @@ mod tests {
             own.store().get_user_identity(alice_id()).await.unwrap().unwrap().into_own().unwrap();
         list.verify(identity.self_signing_key()).unwrap();
         assert_eq!(list.version(), 1);
-        assert!(list.contains(device_id!("OWNDEVICE")));
+        assert!(list.devices().contains_key(device_id!("OWNDEVICE")));
     }
 
     #[async_test]
@@ -241,5 +243,115 @@ mod tests {
             machine.sign_own_device_list(1, device_set(&["NOIDENTITY"])).await,
             Err(OwnDeviceListError::NoOwnIdentity)
         );
+    }
+
+    async fn secret_request_count(machine: &crate::OlmMachine) -> usize {
+        machine
+            .outgoing_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|outgoing| match outgoing.request.as_ref() {
+                AnyOutgoingRequest::ToDeviceRequest(request) => {
+                    request.event_type.to_string() == "m.secret.request"
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    #[async_test]
+    async fn test_restricted_device_does_not_create_a_cross_signing_identity() {
+        let machine = crate::OlmMachine::new(alice_id(), device_id!("BORROWED")).await;
+        machine.set_device_restricted(true).await.unwrap();
+
+        // Neither the first bootstrap nor a reset.
+        for reset in [false, true] {
+            assert!(matches!(
+                machine.bootstrap_cross_signing(reset).await,
+                Err(crate::BootstrapCrossSigningError::Signature(SignatureError::DeviceRestricted))
+            ));
+        }
+        assert!(machine.store().get_user_identity(alice_id()).await.unwrap().is_none());
+        assert!(!machine.cross_signing_status().await.has_self_signing);
+
+        // Control: lifting the restriction restores the old behaviour.
+        machine.set_device_restricted(false).await.unwrap();
+        machine.bootstrap_cross_signing(false).await.unwrap();
+        assert!(machine.cross_signing_status().await.has_self_signing);
+    }
+
+    #[async_test]
+    async fn test_marking_restricted_purges_a_recovery_key_from_the_secret_inbox() {
+        use ruma::events::secret::request::SecretName;
+
+        use crate::store::types::{Changes, SecretsInboxItem};
+
+        let machine = crate::OlmMachine::new(alice_id(), device_id!("BORROWED")).await;
+        machine
+            .store()
+            .save_changes(Changes {
+                secrets: vec![SecretsInboxItem {
+                    secret_name: SecretName::RecoveryKey,
+                    secret: "a recovery key that arrived early".to_owned().into(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.store().get_secrets_from_inbox(&SecretName::RecoveryKey).await.unwrap().len(),
+            1
+        );
+
+        // Control: lifting a restriction that was never set purges nothing.
+        machine.set_device_restricted(false).await.unwrap();
+        assert_eq!(
+            machine.store().get_secrets_from_inbox(&SecretName::RecoveryKey).await.unwrap().len(),
+            1
+        );
+
+        machine.set_device_restricted(true).await.unwrap();
+        assert!(
+            machine
+                .store()
+                .get_secrets_from_inbox(&SecretName::RecoveryKey)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the backup could otherwise be resumed with it"
+        );
+    }
+
+    #[async_test]
+    async fn test_a_queued_secret_request_is_not_sent_while_restricted() {
+        use ruma::events::secret::request::SecretName;
+
+        use crate::{gossiping::GossipMachine, store::types::Changes};
+
+        let (alice, _) = get_machine_pair_with_session(alice_id(), bob_id(), false).await;
+
+        // A request that was queued in the window around the flag being set,
+        // or that is restored after a crash: it is in the store *after* the
+        // flag, so `set_device_restricted` never saw it.
+        alice.set_device_restricted(true).await.unwrap();
+        alice
+            .store()
+            .save_changes(Changes {
+                key_requests: GossipMachine::request_missing_secrets(
+                    alice.user_id(),
+                    vec![SecretName::RecoveryKey],
+                ),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(unsent_secret_requests(&**alice.store()).await > 0);
+
+        assert_eq!(secret_request_count(&alice).await, 0);
+
+        // Control: without the restriction the same request goes out.
+        alice.set_device_restricted(false).await.unwrap();
+        assert!(secret_request_count(&alice).await > 0);
     }
 }

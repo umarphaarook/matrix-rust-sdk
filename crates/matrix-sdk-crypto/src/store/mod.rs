@@ -1758,6 +1758,15 @@ impl Store {
         bundle: RoomKeyBundle,
         progress_listener: impl Fn(usize, usize),
     ) -> Result<(), CryptoStoreError> {
+        // Whichever device of the invited user downloads the bundle is the
+        // one that imports it, and a restricted (borrowed) device must not
+        // end up with the room's older history. This also covers a bundle
+        // stored before the device was restricted.
+        if self.is_device_restricted().await? {
+            warn!("Not importing a historic room key bundle on a restricted device");
+            return Ok(());
+        }
+
         let sender_data = if bundle_info.sender_data.should_recalculate() {
             let device = self
                 .get_device_from_curve_key(&bundle_info.sender_user, bundle_info.sender_key)
@@ -2480,6 +2489,61 @@ mod tests {
                 ..
             }
         );
+    }
+
+    /// Share one visible session in a bundle from Alice to a Bob whose
+    /// restriction is given, and return how many sessions Bob ended up with
+    /// for the room.
+    async fn import_bundle_on_bob(bob_restricted: bool) -> usize {
+        let alice = OlmMachine::new(user_id!("@a:s.co"), device_id!("ALICE")).await;
+        let alice_key = alice.identity_keys().curve25519;
+        let bob = OlmMachine::new(user_id!("@b:s.co"), device_id!("BOB")).await;
+        bob.set_device_restricted(bob_restricted).await.unwrap();
+
+        let room_id = room_id!("!room1:localhost");
+        let session_key = "AgAAAAC2XHVzsMBKs4QCRElJ92CJKyGtknCSC8HY7cQ7UYwndMKLQAejXLh5UA0l6s736mgctcUMNvELScUWrObdflrHo+vth/gWreXOaCnaSxmyjjKErQwyIYTkUfqbHy40RJfEesLwnN23on9XAkch/iy8R2+Jz7B8zfG01f2Ow2SxPQFnAndcO1ZSD2GmXgedy6n4B20MWI1jGP2wiexOWbFSya8DO/VxC9m5+/mF+WwYqdpKn9g4Y05Yw4uz7cdjTc3rXm7xK+8E7hI//5QD1nHPvuKYbjjM9u2JSL+Bzp61Cw";
+        let session = create_inbound_group_session_with_visibility(
+            &alice,
+            room_id,
+            &SessionKey::from_base64(session_key).unwrap(),
+            true,
+        );
+        alice.store().save_inbound_group_sessions(&[session]).await.unwrap();
+        let bundle = alice.store().build_room_key_bundle(room_id).await.unwrap();
+
+        bob.store()
+            .receive_room_key_bundle(
+                &StoredRoomKeyBundleData {
+                    sender_user: alice.user_id().to_owned(),
+                    sender_key: alice_key,
+                    sender_data: SenderData::sender_verified(
+                        alice.user_id(),
+                        device_id!("ALICE"),
+                        alice.identity_keys().ed25519,
+                    ),
+                    bundle_data: RoomKeyBundleContent {
+                        room_id: room_id.to_owned(),
+                        file: EncryptedFile::new(
+                            owned_mxc_uri!("mxc://example.com/0"),
+                            V2EncryptedFileInfo::encode([0; 32], [0; 16]).into(),
+                            EncryptedFileHashes::with_sha256([0; 32]),
+                        ),
+                    },
+                },
+                bundle,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+
+        bob.store().get_inbound_group_sessions_by_room_id(room_id).await.unwrap().len()
+    }
+
+    #[async_test]
+    async fn test_restricted_device_does_not_import_a_room_key_bundle() {
+        // Control: the same bundle is imported by an unrestricted device.
+        assert_eq!(import_bundle_on_bob(false).await, 1);
+        assert_eq!(import_bundle_on_bob(true).await, 0);
     }
 
     /// Tests that the new store format introduced in [#5737][#5737] does not

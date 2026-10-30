@@ -309,6 +309,11 @@ pub enum SignatureError {
     #[error(transparent)]
     JsonError(#[from] CanonicalJsonError),
 
+    /// This device is restricted: it does not sign anything on the account's
+    /// behalf.
+    #[error("this device is restricted and does not sign on the account's behalf")]
+    DeviceRestricted,
+
     /// The store ran into an error.
     #[error(transparent)]
     StoreError(#[from] CryptoStoreError),

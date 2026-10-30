@@ -150,6 +150,12 @@ impl GossipMachine {
 
     /// Load stored outgoing requests that were not yet sent out.
     async fn load_outgoing_requests(&self) -> Result<Vec<OutgoingRequest>, CryptoStoreError> {
+        // A restricted device never asks for the account's secrets. The flag
+        // is checked here, at send time, as well as when requests are created
+        // and when the flag is set, so a request queued in a race with the
+        // flag, or restored after a crash, still goes nowhere.
+        let restricted = self.inner.store.is_device_restricted().await?;
+
         Ok(self
             .inner
             .store
@@ -157,6 +163,7 @@ impl GossipMachine {
             .await?
             .into_iter()
             .filter(|i| !i.sent_out)
+            .filter(|i| !(restricted && matches!(i.info, SecretInfo::SecretRequest(_))))
             .map(|info| info.to_request(self.device_id()))
             .collect())
     }
@@ -319,7 +326,12 @@ impl GossipMachine {
 
         for device in devices.devices() {
             if !device.is_our_own_device() && device.is_verified() {
-                if !self.inner.store.own_device_list_permits(device.device_id()).await {
+                if !self
+                    .inner
+                    .store
+                    .own_device_list_permits(device.device_id(), device.ed25519_key())
+                    .await
+                {
                     info!(
                         ?secret_name,
                         device_id = ?device.device_id(),
@@ -431,7 +443,12 @@ impl GossipMachine {
         if let Some(device) = device {
             if device.user_id() == self.user_id() {
                 if device.is_verified() {
-                    if !self.inner.store.own_device_list_permits(device.device_id()).await {
+                    if !self
+                        .inner
+                        .store
+                        .own_device_list_permits(device.device_id(), device.ed25519_key())
+                        .await
+                    {
                         info!(
                             user_id = ?device.user_id(),
                             device_id = ?device.device_id(),
@@ -799,7 +816,11 @@ impl GossipMachine {
         // checks below: it gets only what we recorded sharing with it.
         if device.user_id() == self.user_id()
             && device.is_verified()
-            && self.inner.store.own_device_list_permits(device.device_id()).await
+            && self
+                .inner
+                .store
+                .own_device_list_permits(device.device_id(), device.ed25519_key())
+                .await
         {
             Ok(None)
         // Otherwise, if the records show we previously shared with this device,
@@ -1761,6 +1782,19 @@ mod tests {
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_should_share_key() {
+        should_share_key_cycle(false).await;
+    }
+
+    /// The same, for a device that has accepted a signed own-device list naming
+    /// the requesting device.
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_should_share_key_with_a_list_naming_the_device() {
+        should_share_key_cycle(true).await;
+    }
+
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn should_share_key_cycle(with_list: bool) {
         let machine = get_machine_test_helper().await;
         let account = account();
 
@@ -1775,6 +1809,10 @@ mod tests {
             Err(KeyForwardDecision::UntrustedDevice)
         );
         own_device.set_trust_state(LocalTrust::Verified);
+        if with_list {
+            setup_own_identity(&machine).await;
+            enforce_own_device_list(&machine, 1, &[alice_device_id(), alice2_device_id()]).await;
+        }
         // Now we do want to share the keys.
         machine.should_share_key(&own_device, &inbound).await.unwrap();
 
@@ -1875,9 +1913,20 @@ mod tests {
     }
 
     #[cfg(feature = "automatic-room-key-forwarding")]
-    async fn test_key_share_cycle(algorithm: EventEncryptionAlgorithm) {
+    async fn test_key_share_cycle(algorithm: EventEncryptionAlgorithm, with_list: bool) {
         let (alice_machine, group_session, bob_machine) =
             machines_for_key_share_test_helper(alice_id(), true, algorithm).await;
+
+        if with_list {
+            // Bob, who answers, has accepted a signed list naming both devices.
+            setup_own_identity(&bob_machine).await;
+            enforce_own_device_list(
+                &bob_machine,
+                1,
+                &[bob_machine.device_id(), alice_machine.device_id()],
+            )
+            .await;
+        }
 
         // Get the request and convert it into a event.
         let requests = alice_machine.outgoing_to_device_requests().await.unwrap();
@@ -2043,17 +2092,32 @@ mod tests {
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_key_share_cycle_megolm_v1() {
-        test_key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2).await;
+        test_key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2, false).await;
+    }
+
+    #[async_test]
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    async fn test_key_share_cycle_megolm_v1_with_a_list() {
+        test_key_share_cycle(EventEncryptionAlgorithm::MegolmV1AesSha2, true).await;
     }
 
     #[async_test]
     #[cfg(all(feature = "experimental-algorithms", feature = "automatic-room-key-forwarding"))]
     async fn test_key_share_cycle_megolm_v2() {
-        test_key_share_cycle(EventEncryptionAlgorithm::MegolmV2AesSha2).await;
+        test_key_share_cycle(EventEncryptionAlgorithm::MegolmV2AesSha2, false).await;
     }
 
     #[async_test]
     async fn test_secret_share_cycle() {
+        secret_share_cycle(false).await;
+    }
+
+    #[async_test]
+    async fn test_secret_share_cycle_with_a_list_naming_the_device() {
+        secret_share_cycle(true).await;
+    }
+
+    async fn secret_share_cycle(with_list: bool) {
         let alice_machine = get_machine_test_helper().await;
 
         let mut second_account = alice_2_account();
@@ -2140,6 +2204,12 @@ mod tests {
         let devices = std::slice::from_ref(&alice_device);
         alice_machine.inner.store.save_device_data(devices).await.unwrap();
 
+        if with_list {
+            setup_own_identity(&alice_machine).await;
+            enforce_own_device_list(&alice_machine, 1, &[alice_device_id(), alice2_device_id()])
+                .await;
+        }
+
         alice_machine.receive_incoming_secret_request(&event);
         {
             let alice_cache = alice_machine.inner.store.cache().await.unwrap();
@@ -2150,6 +2220,15 @@ mod tests {
 
     #[async_test]
     async fn test_secret_broadcasting() {
+        secret_broadcasting(false).await;
+    }
+
+    #[async_test]
+    async fn test_secret_broadcasting_with_a_list_naming_the_device() {
+        secret_broadcasting(true).await;
+    }
+
+    async fn secret_broadcasting(with_list: bool) {
         use futures_util::{FutureExt, pin_mut};
         use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;
         use serde_json::value::to_raw_value;
@@ -2212,6 +2291,14 @@ mod tests {
             .save_decryption_key(Some(decryption_key), None)
             .await
             .unwrap();
+        if with_list {
+            alice_machine.bootstrap_cross_signing(false).await.unwrap();
+            let devices = std::collections::BTreeMap::from([
+                (alice_machine.device_id().to_owned(), alice_machine.identity_keys().ed25519),
+                (bob_machine.device_id().to_owned(), bob_machine.identity_keys().ed25519),
+            ]);
+            alice_machine.sign_own_device_list(1, devices).await.unwrap();
+        }
         alice_machine.inner.key_request_machine.receive_incoming_secret_request(&event);
         {
             let alice_cache = alice_machine.store().cache().await.unwrap();
@@ -2430,7 +2517,18 @@ mod tests {
     #[async_test]
     #[cfg(feature = "experimental-push-secrets")]
     async fn test_secret_pushing() {
-        let (alice_machine, _alice_device, _bob_machine, bob_device, _decryption_key) =
+        secret_pushing(false).await;
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_secret_pushing_with_a_list_naming_the_device() {
+        secret_pushing(true).await;
+    }
+
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn secret_pushing(with_list: bool) {
+        let (alice_machine, _alice_device, bob_machine, bob_device, _decryption_key) =
             set_up_secret_push().await;
 
         // try to push a secret, but the other device isn't verified, so nothing
@@ -2459,6 +2557,15 @@ mod tests {
         // Now the device is trusted, so the secret should be pushed
         bob_device.set_trust_state(LocalTrust::Verified);
         alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+
+        if with_list {
+            alice_machine.bootstrap_cross_signing(false).await.unwrap();
+            let devices = std::collections::BTreeMap::from([
+                (alice_machine.device_id().to_owned(), alice_machine.identity_keys().ed25519),
+                (bob_machine.device_id().to_owned(), bob_machine.identity_keys().ed25519),
+            ]);
+            alice_machine.sign_own_device_list(1, devices).await.unwrap();
+        }
 
         alice_machine
             .inner
@@ -2705,9 +2812,9 @@ mod tests {
             .unwrap();
         if with_list {
             alice_machine.bootstrap_cross_signing(false).await.unwrap();
-            let devices = std::collections::BTreeSet::from([
-                alice_machine.device_id().to_owned(),
-                bob_machine.device_id().to_owned(),
+            let devices = std::collections::BTreeMap::from([
+                (alice_machine.device_id().to_owned(), alice_machine.identity_keys().ed25519),
+                (bob_machine.device_id().to_owned(), bob_machine.identity_keys().ed25519),
             ]);
             let list = alice_machine.sign_own_device_list(1, devices).await.unwrap();
             alice_machine.receive_own_device_list(Some(&list)).await.unwrap();
@@ -2907,11 +3014,25 @@ mod tests {
         version: u64,
         devices: &[&DeviceId],
     ) -> crate::types::OwnDeviceList {
-        let mut list = crate::types::OwnDeviceList::new(
-            machine.user_id().to_owned(),
-            version,
-            devices.iter().map(|d| (*d).to_owned()).collect(),
-        );
+        let mut keyed = std::collections::BTreeMap::new();
+        for id in devices {
+            let key = if *id == machine.device_id() {
+                machine.inner.store.static_account().identity_keys().ed25519
+            } else {
+                machine
+                    .inner
+                    .store
+                    .get_device(machine.user_id(), id)
+                    .await
+                    .unwrap()
+                    .and_then(|device| device.ed25519_key())
+                    .expect("the device to list must be known")
+            };
+            keyed.insert((*id).to_owned(), key);
+        }
+
+        let mut list =
+            crate::types::OwnDeviceList::new(machine.user_id().to_owned(), version, keyed);
         machine
             .inner
             .store
@@ -3057,10 +3178,15 @@ mod tests {
 
         if let Some(listed) = bob_listed {
             alice_machine.bootstrap_cross_signing(false).await.unwrap();
-            let mut devices =
-                std::collections::BTreeSet::from([alice_machine.device_id().to_owned()]);
+            let mut devices = std::collections::BTreeMap::from([(
+                alice_machine.device_id().to_owned(),
+                alice_machine.identity_keys().ed25519,
+            )]);
             if listed {
-                devices.insert(bob_machine.device_id().to_owned());
+                devices.insert(
+                    bob_machine.device_id().to_owned(),
+                    bob_machine.identity_keys().ed25519,
+                );
             }
             let list = alice_machine.sign_own_device_list(1, devices).await.unwrap();
             alice_machine.receive_own_device_list(Some(&list)).await.unwrap();

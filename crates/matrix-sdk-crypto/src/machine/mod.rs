@@ -15,7 +15,7 @@
 #[cfg(feature = "experimental-encrypted-state-events")]
 use std::borrow::Borrow;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -64,7 +64,7 @@ use tracing::{
     field::{debug, display},
     info, instrument, trace, warn,
 };
-use vodozemac::{Curve25519PublicKey, Ed25519Signature, megolm::DecryptionError};
+use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature, megolm::DecryptionError};
 
 #[cfg(feature = "experimental-push-secrets")]
 use crate::error::SecretPushError;
@@ -796,6 +796,13 @@ impl OlmMachine {
         &self,
         reset: bool,
     ) -> Result<CrossSigningBootstrapRequests, BootstrapCrossSigningError> {
+        // A restricted (borrowed) device never creates or replaces the
+        // account's cross-signing identity: with a fresh identity it would
+        // hold secrets of its own to sign lists and approve devices with.
+        if self.store().is_device_restricted().await? {
+            return Err(SignatureError::DeviceRestricted.into());
+        }
+
         // Don't hold the lock, otherwise we might deadlock in
         // `bootstrap_cross_signing()` on `account` if a sync task is already
         // running (which locks `account`), or we will deadlock
@@ -1101,6 +1108,13 @@ impl OlmMachine {
         event: &DecryptedRoomKeyBundleEvent,
         changes: &mut Changes,
     ) -> OlmResult<()> {
+        // A restricted (borrowed) device never gets the older history of a
+        // room it is invited to, so it does not even keep the bundle.
+        if self.store().is_device_restricted().await? {
+            warn!("Ignoring a room key bundle on a restricted device");
+            return Ok(());
+        }
+
         let Some(sender_device_keys) = &event.sender_device_keys else {
             warn!("Received a room key bundle with no sender device keys: ignoring");
             return Ok(());
@@ -2166,7 +2180,9 @@ impl OlmMachine {
     /// verification.
     ///
     /// Marking the device restricted also drops any secret requests that were
-    /// queued but not yet sent.
+    /// queued but not yet sent, and any secret already waiting in the secret
+    /// inbox (a recovery key that arrived before the flag was set), so that
+    /// nothing can later enable backups with it.
     ///
     /// Lifting the restriction (`restricted == false`) is only meaningful once
     /// the device holds the secrets itself, for example because the user
@@ -2179,6 +2195,15 @@ impl OlmMachine {
                 if matches!(request.info, crate::SecretInfo::SecretRequest(_)) {
                     self.store().delete_outgoing_secret_requests(&request.request_id).await?;
                 }
+            }
+
+            for name in [
+                SecretName::RecoveryKey,
+                SecretName::CrossSigningMasterKey,
+                SecretName::CrossSigningUserSigningKey,
+                SecretName::CrossSigningSelfSigningKey,
+            ] {
+                self.store().delete_secrets_from_inbox(&name).await?;
             }
         }
 
@@ -2235,11 +2260,17 @@ impl OlmMachine {
     ///   self-signing key, or [`OwnDeviceListError::VersionNotAboveSeen`] is
     ///   returned.
     ///
-    /// * `devices` - The user's own devices, including this one.
+    /// * `devices` - The user's own devices, including this one, each with its
+    ///   Ed25519 identity key. A device is on the list only with that key, so a
+    ///   new device given the ID of a deleted one is not.
+    ///
+    /// The signed list is accepted by this device before it is returned, so a
+    /// device that signs enforces the list from that moment, whether or not
+    /// the server ever shows it the list again.
     pub async fn sign_own_device_list(
         &self,
         version: u64,
-        devices: BTreeSet<OwnedDeviceId>,
+        devices: BTreeMap<OwnedDeviceId, Ed25519PublicKey>,
     ) -> Result<OwnDeviceList, OwnDeviceListError> {
         if self.store().is_device_restricted().await? {
             return Err(OwnDeviceListError::Restricted);
@@ -2265,7 +2296,79 @@ impl OlmMachine {
         // because the private key is not the one the identity advertises.
         list.verify(own_identity.self_signing_key())?;
 
-        Ok(list)
+        // Enforce it ourselves from now on, with no help from the server.
+        match self.store().receive_own_device_list(Some(&list)).await? {
+            OwnDeviceListOutcome::Accepted { .. } => Ok(list),
+            other => Err(OwnDeviceListError::NotAccepted(other)),
+        }
+    }
+
+    /// Make the own-device list required, or not. While it is required, a
+    /// device that has accepted no valid list serves nobody.
+    ///
+    /// Set it on the first start of a build that supports the list, before
+    /// the first sync is processed.
+    pub async fn set_own_device_list_required(&self, required: bool) -> StoreResult<()> {
+        self.store().set_own_device_list_required(required).await
+    }
+
+    /// Has the own-device list been made required?
+    pub async fn own_device_list_required(&self) -> StoreResult<bool> {
+        self.store().own_device_list_required().await
+    }
+
+    /// Refuse every own-device list below `floor`. See
+    /// [`Store::set_own_device_list_version_floor`](crate::store::Store).
+    pub async fn set_own_device_list_version_floor(&self, floor: u64) -> StoreResult<()> {
+        self.store().set_own_device_list_version_floor(floor).await
+    }
+
+    /// The version floor set for the own-device list, `0` if none.
+    pub async fn own_device_list_version_floor(&self) -> StoreResult<u64> {
+        self.store().own_device_list_version_floor().await
+    }
+
+    /// Adopt the current cross-signing identity as the one own-device lists
+    /// come from, discarding what this device remembers of the previous
+    /// identity's lists.
+    ///
+    /// After the user's cross-signing identity changes, this device accepts
+    /// lists from the new identity only if the new master key was signed by a
+    /// device on the last list it accepted. Entering the recovery key (or a
+    /// genuine "start fresh" done elsewhere, then confirmed here) gives this
+    /// device the new private keys; this call is how the application records
+    /// that. It fails unless this device is not restricted and really holds
+    /// the private keys of the identity in its store, so a borrowed device can
+    /// not call it to launder a new identity. The version floor, and whether
+    /// lists are required, are left as they are.
+    pub async fn adopt_own_identity_for_device_list(&self) -> Result<(), OwnDeviceListError> {
+        if self.store().is_device_restricted().await? {
+            return Err(OwnDeviceListError::Restricted);
+        }
+
+        let own_identity = self
+            .store()
+            .get_user_identity(self.user_id())
+            .await?
+            .and_then(|identity| identity.into_own())
+            .filter(|identity| identity.is_verified())
+            .ok_or(OwnDeviceListError::NoOwnIdentity)?;
+
+        {
+            let private = self.inner.user_identity.lock().await;
+            let holds_current_keys = private.has_master_key().await
+                && private.can_sign_devices().await
+                && private.self_signing_public_key().await.and_then(|k| k.get_first_key())
+                    == own_identity.self_signing_key().get_first_key()
+                && private.master_public_key().await.and_then(|k| k.get_first_key())
+                    == own_identity.master_key().get_first_key();
+            if !holds_current_keys {
+                return Err(OwnDeviceListError::SecretsNotHeld);
+            }
+        }
+
+        self.store().forget_own_device_list_state().await?;
+        Ok(())
     }
 
     /// Request missing local secrets from our devices (cross signing private

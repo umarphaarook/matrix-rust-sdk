@@ -44,7 +44,7 @@ mod cross_signing;
 mod device_keys;
 pub mod events;
 mod one_time_keys;
-mod own_device_list;
+pub(crate) mod own_device_list;
 pub mod qr_login;
 pub mod requests;
 pub mod room_history;

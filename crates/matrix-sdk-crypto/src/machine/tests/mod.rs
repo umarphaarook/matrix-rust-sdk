@@ -2278,3 +2278,43 @@ async fn test_verified_latch_migration() {
         assert!(!tu.dirty);
     });
 }
+
+/// The device that receives an `m.room_key_bundle` keeps it for the download
+/// and import. A restricted device keeps nothing.
+#[async_test]
+async fn test_restricted_device_ignores_a_room_key_bundle() {
+    let alice = OlmMachine::new(alice_id(), alice_device_id()).await;
+    let bob = OlmMachine::new(bob_id(), bob_device_id()).await;
+
+    let content = crate::types::events::room_key_bundle::RoomKeyBundleContent {
+        room_id: room_id!("!room1:localhost").to_owned(),
+        file: ruma::events::room::EncryptedFile::new(
+            ruma::owned_mxc_uri!("mxc://example.com/0"),
+            ruma::events::room::V2EncryptedFileInfo::encode([0; 32], [0; 16]).into(),
+            ruma::events::room::EncryptedFileHashes::with_sha256([0; 32]),
+        ),
+    };
+    let event = crate::types::events::olm_v1::DecryptedRoomKeyBundleEvent::new(
+        alice_id(),
+        bob_id(),
+        alice.identity_keys().ed25519,
+        Some(alice.store().cache().await.unwrap().account().await.unwrap().device_keys()),
+        content,
+    );
+
+    let sender_key = alice.identity_keys().curve25519;
+    let received = |bob: &OlmMachine, event| {
+        let bob = bob.clone();
+        async move {
+            let mut changes = Changes::default();
+            bob.receive_room_key_bundle_data(sender_key, &event, &mut changes).await.unwrap();
+            changes.received_room_key_bundles.len()
+        }
+    };
+
+    // Control: an unrestricted device stores the bundle details.
+    assert_eq!(received(&bob, event.clone()).await, 1);
+
+    bob.set_device_restricted(true).await.unwrap();
+    assert_eq!(received(&bob, event).await, 0);
+}
