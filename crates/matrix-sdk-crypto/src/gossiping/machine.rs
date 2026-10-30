@@ -367,6 +367,13 @@ impl GossipMachine {
         event: &DecryptedSecretPushEvent,
         changes: &mut Changes,
     ) -> Result<(), CryptoStoreError> {
+        // A restricted (borrowed) device never accepts the account's secrets,
+        // whoever sends them.
+        if self.inner.store.is_device_restricted().await? {
+            warn!("Dropping a secret push, this device is restricted");
+            return Ok(());
+        }
+
         // Only accept events from verified own-devices
         let sender = &event.sender;
         if sender != self.user_id() {
@@ -1063,6 +1070,14 @@ impl GossipMachine {
         changes: &mut Changes,
     ) -> Result<Option<SecretName>, CryptoStoreError> {
         debug!("Received a m.secret.send event");
+
+        // A restricted (borrowed) device discards every secret it is sent, even
+        // one that matches a request it made earlier or one from a trusted own
+        // device. This runs before anything is looked up or imported.
+        if self.inner.store.is_device_restricted().await? {
+            warn!("Dropping a m.secret.send event, this device is restricted");
+            return Ok(None);
+        }
 
         let request_id = &event.content.request_id;
 
@@ -2582,5 +2597,227 @@ mod tests {
             .unwrap();
 
         assert!(stream.next().now_or_never().flatten().is_none());
+    }
+
+    /// Alice serves a backup key to her other device Bob, who asked for it,
+    /// and Bob receives it. Returns whether the secret reached Bob's secrets
+    /// stream and how many secrets are in Bob's inbox afterwards.
+    ///
+    /// When `bob_restricted` is set, Bob is marked restricted after his request
+    /// went out, as a modified client or a late flag would leave it: the
+    /// request is still on record, but the secret must be discarded.
+    async fn serve_backup_key_to_bob(bob_restricted: bool) -> (bool, usize) {
+        use futures_util::{FutureExt, pin_mut};
+        use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;
+        use serde_json::value::to_raw_value;
+        use tokio_stream::StreamExt;
+
+        use crate::{
+            EncryptionSyncChanges,
+            machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
+        };
+
+        let alice_id = user_id!("@alice:localhost");
+
+        let (alice_machine, bob_machine) =
+            get_machine_pair_with_setup_sessions_test_helper(alice_id, alice_id, false).await;
+
+        let key_requests = GossipMachine::request_missing_secrets(
+            bob_machine.user_id(),
+            vec![SecretName::RecoveryKey],
+        );
+        let mut changes = Changes::default();
+        let request_id = key_requests[0].request_id.to_owned();
+        changes.key_requests = key_requests;
+        bob_machine.store().save_changes(changes).await.unwrap();
+        for request in bob_machine.outgoing_requests().await.unwrap() {
+            bob_machine
+                .mark_request_as_sent(request.request_id(), &ToDeviceResponse::new())
+                .await
+                .unwrap();
+        }
+
+        if bob_restricted {
+            bob_machine.set_device_restricted(true).await.unwrap();
+        }
+
+        let event = RumaToDeviceEvent::new(
+            alice_machine.user_id().to_owned(),
+            ToDeviceSecretRequestEventContent::new(
+                RequestAction::Request(SecretRequestAction::new(SecretName::RecoveryKey)),
+                bob_machine.device_id().to_owned(),
+                request_id,
+            ),
+        );
+
+        let bob_device = alice_machine
+            .get_device(alice_id, bob_machine.device_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let alice_device = bob_machine
+            .get_device(alice_id, alice_machine.device_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        bob_device.set_trust_state(LocalTrust::Verified);
+        alice_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+        bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
+
+        let decryption_key = crate::store::types::BackupDecryptionKey::new();
+        alice_machine
+            .backup_machine()
+            .save_decryption_key(Some(decryption_key), None)
+            .await
+            .unwrap();
+        alice_machine.inner.key_request_machine.receive_incoming_secret_request(&event);
+        {
+            let alice_cache = alice_machine.store().cache().await.unwrap();
+            alice_machine
+                .inner
+                .key_request_machine
+                .collect_incoming_key_requests(&alice_cache)
+                .await
+                .unwrap();
+        }
+
+        let requests =
+            alice_machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = requests.first().expect("Alice should serve the secret");
+
+        let event: EncryptedToDeviceEvent =
+            request_to_event(bob_machine.user_id(), alice_machine.user_id(), request);
+        let event = Raw::from_json(to_raw_value(&event).unwrap());
+
+        let stream = bob_machine.store().secrets_stream();
+        pin_mut!(stream);
+
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
+
+        bob_machine
+            .receive_sync_changes(
+                EncryptionSyncChanges {
+                    to_device_events: vec![event],
+                    changed_devices: &Default::default(),
+                    one_time_keys_counts: &Default::default(),
+                    unused_fallback_keys: None,
+                    next_batch_token: None,
+                },
+                &decryption_settings,
+            )
+            .await
+            .unwrap();
+
+        let in_stream = stream.next().now_or_never().flatten().is_some();
+        let in_inbox = bob_machine
+            .store()
+            .get_secrets_from_inbox(&SecretName::RecoveryKey)
+            .await
+            .unwrap()
+            .len();
+
+        (in_stream, in_inbox)
+    }
+
+    #[async_test]
+    async fn test_unrestricted_device_receives_a_sent_secret() {
+        // Control for the restricted case below.
+        assert_eq!(serve_backup_key_to_bob(false).await, (true, 1));
+    }
+
+    #[async_test]
+    async fn test_restricted_device_discards_a_sent_secret() {
+        assert_eq!(serve_backup_key_to_bob(true).await, (false, 0));
+    }
+
+    /// Alice pushes a backup key to Bob. Returns whether it reached Bob's
+    /// secrets stream and how many secrets are in his inbox.
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn push_backup_key_to_bob(bob_restricted: bool) -> (bool, usize) {
+        use futures_util::{FutureExt, pin_mut};
+        use serde_json::value::to_raw_value;
+        use tokio_stream::StreamExt;
+
+        use crate::EncryptionSyncChanges;
+
+        let (alice_machine, alice_device, bob_machine, bob_device, _decryption_key) =
+            set_up_secret_push().await;
+
+        bob_device.set_trust_state(LocalTrust::Verified);
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+
+        alice_machine
+            .inner
+            .key_request_machine
+            .push_secret_to_verified_devices(SecretName::RecoveryKey)
+            .await
+            .unwrap();
+
+        let requests =
+            alice_machine.inner.key_request_machine.outgoing_to_device_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = requests.first().expect("We should have an outgoing to-device request");
+
+        // Alice is trusted by Bob, so an unrestricted Bob accepts the push.
+        alice_device.set_trust_state(LocalTrust::Verified);
+        bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
+        if bob_restricted {
+            bob_machine.set_device_restricted(true).await.unwrap();
+        }
+
+        let event: EncryptedToDeviceEvent =
+            request_to_event(bob_machine.user_id(), alice_machine.user_id(), request);
+        let event = Raw::from_json(to_raw_value(&event).unwrap());
+
+        let stream = bob_machine.store().secrets_stream();
+        pin_mut!(stream);
+
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+            refuse_legacy_from_unsigned_known_devices: false,
+        };
+
+        bob_machine
+            .receive_sync_changes(
+                EncryptionSyncChanges {
+                    to_device_events: vec![event],
+                    changed_devices: &Default::default(),
+                    one_time_keys_counts: &Default::default(),
+                    unused_fallback_keys: None,
+                    next_batch_token: None,
+                },
+                &decryption_settings,
+            )
+            .await
+            .unwrap();
+
+        let in_stream = stream.next().now_or_never().flatten().is_some();
+        let in_inbox = bob_machine
+            .store()
+            .get_secrets_from_inbox(&SecretName::RecoveryKey)
+            .await
+            .unwrap()
+            .len();
+
+        (in_stream, in_inbox)
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_unrestricted_device_accepts_a_pushed_secret() {
+        // Control for the restricted case below.
+        assert_eq!(push_backup_key_to_bob(false).await, (true, 1));
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-push-secrets")]
+    async fn test_restricted_device_drops_a_pushed_secret() {
+        assert_eq!(push_backup_key_to_bob(true).await, (false, 0));
     }
 }
