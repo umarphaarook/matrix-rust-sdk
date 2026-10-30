@@ -1017,6 +1017,14 @@ impl Backups {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
+        // A restricted (borrowed) device takes no part in the backup, even if a
+        // key was stored before it became restricted: enabling would fail on
+        // every start-up. Nothing is enabled, and nothing is an error.
+        if olm_machine.is_device_restricted().await? {
+            info!("Not resuming backups, this device is restricted");
+            return Ok(());
+        }
+
         // Let us first check if we have a stored backup recovery key and a backup
         // version.
         if !self.resume_backup_from_stored_backup_key(olm_machine).await? {
@@ -1317,6 +1325,33 @@ mod test {
             Err(Error::SignatureError(matrix_sdk_base::crypto::SignatureError::DeviceRestricted))
         );
         assert_eq!(client.encryption().backups().state(), BackupState::Unknown);
+    }
+
+    #[async_test]
+    async fn test_resuming_backups_on_a_restricted_device_with_a_stored_key_is_not_an_error() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        let key = BackupDecryptionKey::new();
+
+        // A key and version stored before the device became restricted.
+        {
+            let guard = client.olm_machine().await;
+            let machine = guard.as_ref().unwrap();
+            machine
+                .backup_machine()
+                .save_decryption_key(Some(key), Some("1".to_owned()))
+                .await
+                .unwrap();
+            machine.set_device_restricted(true).await.unwrap();
+        }
+
+        // No error, and no backup. (That the stored key is resumed when the
+        // device is not restricted is covered by the tests above.)
+        backups.maybe_resume_backups().await.expect("a restricted device resumes nothing");
+
+        assert_eq!(backups.state(), BackupState::Unknown);
+        assert!(!backups.are_enabled().await);
     }
 
     /// The backup info for `key`, signed by this client's own device.
