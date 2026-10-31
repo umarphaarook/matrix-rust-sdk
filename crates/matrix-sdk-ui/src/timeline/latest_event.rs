@@ -17,8 +17,9 @@ use matrix_sdk_base::latest_event::LatestEventValue as BaseLatestEventValue;
 use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId};
 use tracing::trace;
 
-use crate::timeline::{
-    Profile, TimelineDetails, TimelineItemContent, event_handler::TimelineAction,
+use crate::{
+    notification_client::NotificationEventEncryption,
+    timeline::{Profile, TimelineDetails, TimelineItemContent, event_handler::TimelineAction},
 };
 
 /// A simplified version of [`matrix_sdk_base::latest_event::LatestEventValue`]
@@ -52,6 +53,15 @@ pub enum LatestEventValue {
 
         /// The content of the remote event.
         content: TimelineItemContent,
+
+        /// How the remote event reached us, with regard to end-to-end
+        /// encryption: decrypted, undecryptable, or sent in the clear.
+        ///
+        /// A decrypted event and one sent in the clear have the same
+        /// `content`, so this is the only way to tell them apart. It is
+        /// derived from the `TimelineEventKind` of the event. Appended last so
+        /// the existing fields keep their place.
+        event_encryption: Option<NotificationEventEncryption>,
     },
 
     /// The latest event represents an invite to a room.
@@ -73,8 +83,9 @@ pub enum LatestEventValue {
         /// The ID of the local event, if it has one already.
         ///
         /// A local event only has an ID once it has been sent and the server
-        /// has acknowledged it (see [`LatestEventValueLocalState::HasBeenSent`]);
-        /// while it is sending, or if it cannot be sent, this is `None`.
+        /// has acknowledged it (see
+        /// [`LatestEventValueLocalState::HasBeenSent`]); while it is
+        /// sending, or if it cannot be sent, this is `None`.
         event_id: Option<OwnedEventId>,
 
         /// The timestamp of the local event.
@@ -123,14 +134,23 @@ impl LatestEventValue {
                     return Self::None;
                 };
                 let is_own = client.user_id().map(|user_id| user_id == sender).unwrap_or(false);
+                // Read the kind before `from_event` consumes the event.
+                let event_encryption =
+                    Some(NotificationEventEncryption::from_event_kind(&timeline_event.kind));
 
                 let profile =
                     TimelineDetails::from_initial_value(Profile::load(room, &sender).await);
 
                 match TimelineItemContent::from_event(room, timeline_event).await {
-                    Some(content) => {
-                        Self::Remote { event_id, timestamp, sender, is_own, profile, content }
-                    }
+                    Some(content) => Self::Remote {
+                        event_id,
+                        timestamp,
+                        sender,
+                        is_own,
+                        profile,
+                        content,
+                        event_encryption,
+                    },
                     None => Self::None,
                 }
             }
@@ -204,6 +224,9 @@ mod tests {
         store::SerializableEventContent,
         test_utils::mocks::MatrixMockServer,
     };
+    use matrix_sdk_common::deserialized_responses::{
+        TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+    };
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{
         MilliSecondsSinceUnixEpoch, event_id,
@@ -216,7 +239,8 @@ mod tests {
 
     use super::{
         super::{MsgLikeContent, MsgLikeKind, TimelineItemContent},
-        BaseLatestEventValue, LatestEventValue, LatestEventValueLocalState, TimelineDetails,
+        BaseLatestEventValue, LatestEventValue, LatestEventValueLocalState,
+        NotificationEventEncryption, TimelineDetails,
     };
 
     #[async_test]
@@ -251,11 +275,12 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content, event_encryption } => {
             assert_eq!(event_id.as_deref(), Some(event_id!("$ev0")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
             assert!(is_own.not());
+            assert_eq!(event_encryption, Some(NotificationEventEncryption::NotEncrypted));
             assert_matches!(profile, TimelineDetails::Unavailable);
             assert_matches!(
                 content,
@@ -264,6 +289,35 @@ mod tests {
                 }
             );
         })
+    }
+
+    /// An event the SDK could not decrypt keeps its label. (The latest events
+    /// task never selects an `m.room.encrypted` event today, but the mapping
+    /// must not turn one into a clear event if that changes.)
+    #[async_test]
+    async fn test_remote_unable_to_decrypt_is_not_reported_as_clear() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_room(&client, JoinedRoomBuilder::new(room_id!("!r0"))).await;
+        let event_factory = EventFactory::new().sender(user_id!("@mnt_io:matrix.org"));
+
+        let base_value = BaseLatestEventValue::Remote(TimelineEvent::from_utd(
+            event_factory
+                .encrypted("cipher", "sender_key", "DEVICE", "session")
+                .event_id(event_id!("$ev0"))
+                .server_ts(42)
+                .into_raw_sync(),
+            UnableToDecryptInfo {
+                session_id: Some("session".to_owned()),
+                reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+            },
+        ));
+        let value =
+            LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
+
+        assert_matches!(value, LatestEventValue::Remote { event_encryption, .. } => {
+            assert_eq!(event_encryption, Some(NotificationEventEncryption::UnableToDecrypt));
+        });
     }
 
     #[async_test]
@@ -398,7 +452,7 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content, event_encryption: _ } => {
             assert_eq!(event_id.as_deref(), Some(event_id!("$ev1")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
@@ -433,7 +487,7 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content, event_encryption: _ } => {
             assert_eq!(event_id.as_deref(), Some(event_id!("$beacon-stop")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);
@@ -481,7 +535,7 @@ mod tests {
         let value =
             LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
 
-        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content } => {
+        assert_matches!(value, LatestEventValue::Remote { event_id, timestamp, sender: received_sender, is_own, profile, content, event_encryption: _ } => {
             assert_eq!(event_id.as_deref(), Some(event_id!("$beacon-start-2")));
             assert_eq!(u64::from(timestamp.get()), 42u64);
             assert_eq!(received_sender, sender);

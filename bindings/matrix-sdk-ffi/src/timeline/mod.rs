@@ -63,6 +63,7 @@ pub use self::{content::TimelineItemContent, msg_like::MessageContent};
 use crate::{
     error::{ClientError, RoomError},
     event::EventOrTransactionId,
+    notification::NotificationEventEncryption,
     ruma::{
         AssetType, AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, PollKind,
         ThumbnailInfo, UserCall, UserStatus, VideoInfo,
@@ -1565,6 +1566,12 @@ pub enum LatestEventValue {
         is_own: bool,
         profile: ProfileDetails,
         content: TimelineItemContent,
+        /// How the event reached us, with regard to end-to-end encryption.
+        /// A decrypted event and one sent in the clear have the same
+        /// `content`, so this is the only way to tell them apart.
+        ///
+        /// `None` when unknown; a client must not read that as a clear event.
+        event_encryption: Option<NotificationEventEncryption>,
     },
     RemoteInvite {
         timestamp: Timestamp,
@@ -1587,16 +1594,23 @@ impl From<UiLatestEventValue> for LatestEventValue {
     fn from(value: UiLatestEventValue) -> Self {
         match value {
             UiLatestEventValue::None => Self::None,
-            UiLatestEventValue::Remote { event_id, timestamp, sender, is_own, profile, content } => {
-                Self::Remote {
-                    event_id: event_id.map(|event_id| event_id.to_string()),
-                    timestamp: timestamp.into(),
-                    sender: sender.to_string(),
-                    is_own,
-                    profile: profile.into(),
-                    content: content.into(),
-                }
-            }
+            UiLatestEventValue::Remote {
+                event_id,
+                timestamp,
+                sender,
+                is_own,
+                profile,
+                content,
+                event_encryption,
+            } => Self::Remote {
+                event_id: event_id.map(|event_id| event_id.to_string()),
+                timestamp: timestamp.into(),
+                sender: sender.to_string(),
+                is_own,
+                profile: profile.into(),
+                content: content.into(),
+                event_encryption: event_encryption.map(Into::into),
+            },
             UiLatestEventValue::RemoteInvite { timestamp, inviter, inviter_profile } => {
                 Self::RemoteInvite {
                     timestamp: timestamp.into(),

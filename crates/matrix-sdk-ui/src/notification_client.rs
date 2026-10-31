@@ -1146,8 +1146,8 @@ impl NotificationEvent {
     }
 }
 
-/// How the event of a notification reached us, with regard to end-to-end
-/// encryption.
+/// How an event reached us, with regard to end-to-end encryption. Used by the
+/// notification items and by the latest event of a room.
 ///
 /// The payload of a decrypted event looks the same as one sent in the clear,
 /// so this is the only reliable way to tell the two apart.
@@ -1166,7 +1166,7 @@ pub enum NotificationEventEncryption {
 
 impl NotificationEventEncryption {
     /// Read the encryption of an event off the kind the SDK gave it.
-    fn from_event_kind(kind: &TimelineEventKind) -> Self {
+    pub(crate) fn from_event_kind(kind: &TimelineEventKind) -> Self {
         match kind {
             TimelineEventKind::Decrypted(_) => Self::Decrypted,
             TimelineEventKind::UnableToDecrypt { .. } => Self::UnableToDecrypt,

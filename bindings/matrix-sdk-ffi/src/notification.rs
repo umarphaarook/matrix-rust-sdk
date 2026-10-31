@@ -37,8 +37,8 @@ pub enum NotificationEvent {
     Invite { sender: String },
 }
 
-/// How the event of a notification reached us, with regard to end-to-end
-/// encryption.
+/// How an event reached us, with regard to end-to-end encryption. Used by
+/// notification items and by the latest event of a room.
 #[derive(Clone, Copy, uniffi::Enum)]
 pub enum NotificationEventEncryption {
     /// The event was encrypted, and has been decrypted.

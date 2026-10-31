@@ -15,6 +15,7 @@
 #![recursion_limit = "256"]
 
 mod encryption_sync_service;
+mod latest_event_encryption;
 mod notification_client;
 mod room_list_service;
 mod sliding_sync;
