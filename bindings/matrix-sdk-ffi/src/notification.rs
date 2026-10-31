@@ -90,14 +90,6 @@ pub struct NotificationItem {
     /// The raw JSON of the underlying event.
     pub raw_event: String,
 
-    /// Whether the underlying event was decrypted, could not be decrypted, or
-    /// was not encrypted in the first place.
-    ///
-    /// Always set for the items of a `NotificationClient`. It is `None` for
-    /// the items handed to a `SyncNotificationListener`, which doesn't know
-    /// how the event reached the client.
-    pub event_encryption: Option<NotificationEventEncryption>,
-
     pub sender_info: NotificationSenderInfo,
     pub room_info: NotificationRoomInfo,
 
@@ -110,6 +102,14 @@ pub struct NotificationItem {
 
     /// The push actions for this notification (notify, sound, highlight, etc.).
     pub actions: Option<Vec<crate::notification_settings::Action>>,
+
+    /// Whether the underlying event was decrypted, could not be decrypted, or
+    /// was not encrypted in the first place.
+    ///
+    /// Always set for the items of a `NotificationClient`. It is `None` for
+    /// the items handed to a `SyncNotificationListener`, which doesn't know
+    /// how the event reached the client.
+    pub event_encryption: Option<NotificationEventEncryption>,
 }
 
 impl NotificationItem {
@@ -131,7 +131,6 @@ impl NotificationItem {
         Self {
             event,
             raw_event,
-            event_encryption: Some(item.event_encryption.into()),
             sender_info: NotificationSenderInfo {
                 display_name: item.sender_display_name,
                 avatar_url: item.sender_avatar_url,
@@ -157,6 +156,7 @@ impl NotificationItem {
             actions: item
                 .actions
                 .map(|a| a.into_iter().filter_map(|action| action.try_into().ok()).collect()),
+            event_encryption: Some(item.event_encryption.into()),
         }
     }
 }
@@ -373,5 +373,25 @@ impl TryFrom<NotificationItemsRequest>
     type Error = ClientError;
     fn try_from(value: NotificationItemsRequest) -> Result<Self, Self::Error> {
         Ok(Self { room_id: value.room_id()?, event_ids: value.event_ids()? })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk_ui::notification_client::NotificationEventEncryption as SdkEncryption;
+
+    use super::NotificationEventEncryption as FfiEncryption;
+
+    #[test]
+    fn test_event_encryption_conversion() {
+        assert!(matches!(FfiEncryption::from(SdkEncryption::Decrypted), FfiEncryption::Decrypted));
+        assert!(matches!(
+            FfiEncryption::from(SdkEncryption::UnableToDecrypt),
+            FfiEncryption::UnableToDecrypt
+        ));
+        assert!(matches!(
+            FfiEncryption::from(SdkEncryption::NotEncrypted),
+            FfiEncryption::NotEncrypted
+        ));
     }
 }

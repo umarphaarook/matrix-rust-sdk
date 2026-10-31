@@ -2525,14 +2525,14 @@ async fn notification_handler(
         NotificationItem {
             event,
             raw_event,
-            // The sync doesn't tell how the event reached the client.
-            event_encryption: None,
             sender_info,
             room_info,
             is_noisy: Some(is_noisy),
             has_mention: Some(has_mention),
             thread_id,
             actions: Some(actions),
+            // The sync doesn't tell how the event reached the client.
+            event_encryption: None,
         },
         room_id,
     );

@@ -562,12 +562,18 @@ impl NotificationClient {
             // The sliding sync decrypts the events it receives when it already has the
             // room key, so the event can arrive here decrypted: the encryption info is
             // the only trace of it.
-            move |raw: Raw<AnySyncTimelineEvent>, info: Option<EncryptionInfo>| async move {
+            move |raw: Raw<AnySyncTimelineEvent>,
+                  info: Option<EncryptionInfo>,
+                  room: Room| async move {
                 match &raw.get_field::<OwnedEventId>("event_id") {
                     Ok(Some(event_id)) => {
-                        let Some(request) =
-                            &requests.iter().find(|request| request.event_ids.contains(event_id))
-                        else {
+                        // Only take the event from the room the notification is about: the
+                        // sync also carries the events of other rooms, and the homeserver
+                        // picks the event ids it sends.
+                        let Some(request) = &requests.iter().find(|request| {
+                            request.room_id == room.room_id()
+                                && request.event_ids.contains(event_id)
+                        }) else {
                             return;
                         };
 
@@ -883,15 +889,13 @@ impl NotificationClient {
                             // couldn't decrypt it after retrying. Use the raw event as is.
                             //
                             // Unless the sliding sync decrypted the event itself, its type on
-                            // the wire tells the two cases apart: an `m.room.encrypted` event
-                            // is one we couldn't decrypt, anything else reached us in the
-                            // clear.
+                            // the wire tells the two cases apart.
                             let event_encryption = if decrypted_by_sync {
                                 NotificationEventEncryption::Decrypted
-                            } else if is_event_encrypted(event_for_redaction_check.event_type()) {
-                                NotificationEventEncryption::UnableToDecrypt
                             } else {
-                                NotificationEventEncryption::NotEncrypted
+                                NotificationEventEncryption::of_undecrypted_event(
+                                    event_for_redaction_check.event_type(),
+                                )
                             };
 
                             match room.event_push_actions(timeline_event).await {
@@ -1166,8 +1170,24 @@ impl NotificationEventEncryption {
         match kind {
             TimelineEventKind::Decrypted(_) => Self::Decrypted,
             TimelineEventKind::UnableToDecrypt { .. } => Self::UnableToDecrypt,
-            TimelineEventKind::PlainText { .. } => Self::NotEncrypted,
+            // The SDK also hands over an `m.room.encrypted` event as plain text when
+            // decrypting it failed hard (no `OlmMachine`, a crypto store error), so
+            // look at the type.
+            TimelineEventKind::PlainText { event } => {
+                match event.get_field::<TimelineEventType>("type") {
+                    Ok(Some(event_type)) => Self::of_undecrypted_event(event_type),
+                    // Not an encrypted event, as far as we can tell.
+                    _ => Self::NotEncrypted,
+                }
+            }
         }
+    }
+
+    /// The encryption of an event that was not decrypted, from its type on the
+    /// wire: an `m.room.encrypted` event is one we couldn't decrypt, anything
+    /// else reached us in the clear.
+    fn of_undecrypted_event(event_type: TimelineEventType) -> Self {
+        if is_event_encrypted(event_type) { Self::UnableToDecrypt } else { Self::NotEncrypted }
     }
 }
 
@@ -1387,6 +1407,7 @@ mod tests {
 
     use assert_matches2::assert_let;
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_base::deserialized_responses::TimelineEventKind;
     use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
     use ruma::{
         api::client::sync::sync_events::v5,
@@ -1400,6 +1421,27 @@ mod tests {
         NotificationItemsRequest, NotificationProcessSetup, NotificationStatus,
         RawNotificationEvent,
     };
+
+    #[test]
+    fn test_event_encryption_of_a_plain_text_event_kind() {
+        let f = EventFactory::new().room(room_id!("!a:b.c")).sender(user_id!("@sender:b.c"));
+
+        let clear = TimelineEventKind::PlainText { event: f.text_msg("clear").into_raw_sync() };
+        assert_eq!(
+            NotificationEventEncryption::from_event_kind(&clear),
+            NotificationEventEncryption::NotEncrypted
+        );
+
+        // An encrypted event the SDK failed to decrypt hard is handed over as plain
+        // text: it is still an undecryptable event, not one sent in the clear.
+        let encrypted = TimelineEventKind::PlainText {
+            event: f.encrypted("cipher", "sender_key", "DEVICE", "session").into_raw_sync(),
+        };
+        assert_eq!(
+            NotificationEventEncryption::from_event_kind(&encrypted),
+            NotificationEventEncryption::UnableToDecrypt
+        );
+    }
 
     #[async_test]
     async fn test_notification_item_returns_thread_id() {
