@@ -17,8 +17,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use matrix_sdk_ui::notification_client::{
     NotificationClient as SdkNotificationClient,
     NotificationClientTimeouts as SdkNotificationClientTimeouts,
-    NotificationEvent as SdkNotificationEvent, NotificationItem as SdkNotificationItem,
-    NotificationStatus as SdkNotificationStatus, RawNotificationEvent as SdkRawNotificationEvent,
+    NotificationEvent as SdkNotificationEvent,
+    NotificationEventEncryption as SdkNotificationEventEncryption,
+    NotificationItem as SdkNotificationItem, NotificationStatus as SdkNotificationStatus,
+    RawNotificationEvent as SdkRawNotificationEvent,
 };
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 
@@ -33,6 +35,29 @@ use crate::{
 pub enum NotificationEvent {
     Timeline { event: Arc<TimelineEvent> },
     Invite { sender: String },
+}
+
+/// How the event of a notification reached us, with regard to end-to-end
+/// encryption.
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum NotificationEventEncryption {
+    /// The event was encrypted, and has been decrypted.
+    Decrypted,
+    /// The event was encrypted, and could not be decrypted.
+    UnableToDecrypt,
+    /// The event was not encrypted: it reached us in the clear. This is also
+    /// the case of invites.
+    NotEncrypted,
+}
+
+impl From<SdkNotificationEventEncryption> for NotificationEventEncryption {
+    fn from(value: SdkNotificationEventEncryption) -> Self {
+        match value {
+            SdkNotificationEventEncryption::Decrypted => Self::Decrypted,
+            SdkNotificationEventEncryption::UnableToDecrypt => Self::UnableToDecrypt,
+            SdkNotificationEventEncryption::NotEncrypted => Self::NotEncrypted,
+        }
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -64,6 +89,14 @@ pub struct NotificationItem {
 
     /// The raw JSON of the underlying event.
     pub raw_event: String,
+
+    /// Whether the underlying event was decrypted, could not be decrypted, or
+    /// was not encrypted in the first place.
+    ///
+    /// Always set for the items of a `NotificationClient`. It is `None` for
+    /// the items handed to a `SyncNotificationListener`, which doesn't know
+    /// how the event reached the client.
+    pub event_encryption: Option<NotificationEventEncryption>,
 
     pub sender_info: NotificationSenderInfo,
     pub room_info: NotificationRoomInfo,
@@ -98,6 +131,7 @@ impl NotificationItem {
         Self {
             event,
             raw_event,
+            event_encryption: Some(item.event_encryption.into()),
             sender_info: NotificationSenderInfo {
                 display_name: item.sender_display_name,
                 avatar_url: item.sender_avatar_url,

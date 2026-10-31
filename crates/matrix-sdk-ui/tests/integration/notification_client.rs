@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Cursor,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use assert_matches::assert_matches;
@@ -9,20 +11,24 @@ use matrix_sdk::{
     ThreadingSupport,
     test_utils::mocks::{MatrixMockServer, RoomContextResponseTemplate},
 };
-use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_base::crypto::decrypt_room_key_export;
+use matrix_sdk_test::{BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::{
     notification_client::{
-        NotificationClient, NotificationEvent, NotificationItemsRequest, NotificationProcessSetup,
+        NotificationClient, NotificationClientTimeouts, NotificationEvent,
+        NotificationEventEncryption, NotificationItemsRequest, NotificationProcessSetup,
         NotificationStatus,
     },
     sync_service::SyncService,
 };
 use ruma::{
-    RoomVersionId,
+    RoomId, RoomVersionId,
     api::client::sync::sync_events::v5::{Response, response},
     assign, event_id,
-    events::{Mentions, TimelineEventType, room::member::MembershipState},
-    mxc_uri, owned_user_id, room_id, uint, user_id,
+    events::{AnySyncTimelineEvent, Mentions, TimelineEventType, room::member::MembershipState},
+    mxc_uri, owned_user_id, room_id,
+    serde::Raw,
+    uint, user_id,
 };
 use serde_json::json;
 use wiremock::{
@@ -1260,4 +1266,275 @@ async fn test_notification_room_display_name_excludes_service_members() {
             .unwrap()
     );
     assert_eq!(notification.room_computed_display_name, expected_display_name);
+}
+
+/// A megolm session of `ENCRYPTED_EVENT_ROOM_ID`, along with an event
+/// encrypted with it that decrypts to "It's a secret to everybody".
+const ENCRYPTED_EVENT_ROOM_ID: &str = "!DovneieKSTkdHKpIXy:morpheus.localhost";
+const ENCRYPTED_EVENT_SESSION_ID: &str = "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU";
+const ENCRYPTED_EVENT_SESSION_KEY: &[u8] = b"\
+    -----BEGIN MEGOLM SESSION DATA-----\n\
+    ASKcWoiAVUM97482UAi83Avce62hSLce7i5JhsqoF6xeAAAACqt2Cg3nyJPRWTTMXxXH7TXnkfdlmBXbQtq5\
+    bpHo3LRijcq2Gc6TXilESCmJN14pIsfKRJrWjZ0squ/XsoTFytuVLWwkNaW3QF6obeg2IoVtJXLMPdw3b2vO\
+    vgwGY3OMP0XafH13j1vcb6YLzvgLkZQLnYvd47hv3yK/9GmKS9tokuaQ7dCVYckYcIOS09EDTs70YdxUd5WG\
+    rQynATCLFP1p/NAGv70r9MK7Cy/mNpjD0r4qC7UEDIoi1kOWzHgnLo19wtvwsb8Fg8ATxcs3Wmtj8hIUYpDx\
+    ia4sM10zbytUuaPUAfCDf42IyxdmOnGe1CueXhgI71y+RW0s0argNqUt7jB70JT0o9CyX6UBGRaqLk2MPY9T\
+    hUu5J8X3UgIa6rcbWigzohzWm9rdbEHFrSWqjpfQYMaAKQQgETrjSy4XTrp2RhC2oNqG/hylI4ab+F4X6fpH\
+    DYP1NqNMP5g36xNu7LhDnrUB5qsPjYOmWORxGLfudpF3oLYCSlr3DgHqEIB6HjQblLZ3KQuPBse3zxyROTnS\
+    AhdPH4a/z1wioFtKNVph3hecsiKEdqnz4Y2coSIdhz58mJ9JWNQoFAENE5CSsoEZAGvafYZVpW4C75YY2zq1\
+    wIeiFi1dT43/jLAUGkslsi1VvnyfUu8qO404RxYO3XHoGLMFoFLOO+lZ+VGci2Vz10AhxJhEBHxRKxw4k2uB\
+    HztoSJUr/2Y\n\
+    -----END MEGOLM SESSION DATA-----";
+
+/// Build the `m.room.encrypted` event that goes with
+/// `ENCRYPTED_EVENT_SESSION_KEY`.
+fn encrypted_event_builder(
+    event_id: &ruma::EventId,
+) -> matrix_sdk_test::event_factory::EventBuilder<
+    ruma::events::room::encrypted::RoomEncryptedEventContent,
+> {
+    EventFactory::new()
+        .room(&RoomId::parse(ENCRYPTED_EVENT_ROOM_ID).unwrap())
+        .encrypted(
+            "AwgAEtABPRMavuZMDJrPo6pGQP4qVmpcuapuXtzKXJyi3YpEsjSWdzuRKIgJzD4P\
+             cSqJM1A8kzxecTQNJsC5q22+KSFEPxPnI4ltpm7GFowSoPSW9+bFdnlfUzEP1jPq\
+             YevHAsMJp2fRKkzQQbPordrUk1gNqEpGl4BYFeRqKl9GPdKFwy45huvQCLNNueql\
+             CFZVoYMuhxrfyMiJJAVNTofkr2um2mKjDTlajHtr39pTG8k0eOjSXkLOSdZvNOMz\
+             hGhSaFNeERSA2G2YbeknOvU7MvjiO0AKuxaAe1CaVhAI14FCgzrJ8g0y5nly+n7x\
+             QzL2G2Dn8EoXM5Iqj8W99iokQoVsSrUEnaQ1WnSIfewvDDt4LCaD/w7PGETMCQ",
+            "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA",
+            "NLAZCWIOCO",
+            ENCRYPTED_EVENT_SESSION_ID,
+        )
+        .sender(&BOB)
+        .event_id(event_id)
+}
+
+/// Give the client the megolm session that decrypts the event built by
+/// [`encrypted_event_builder`].
+async fn import_encrypted_event_session_key(client: &matrix_sdk::Client) {
+    let exported_keys =
+        decrypt_room_key_export(Cursor::new(ENCRYPTED_EVENT_SESSION_KEY), "1234").unwrap();
+
+    client
+        .olm_machine_for_testing()
+        .await
+        .as_ref()
+        .unwrap()
+        .store()
+        .import_exported_room_keys(exported_keys, |_, _| {})
+        .await
+        .unwrap();
+}
+
+/// A notification client that waits `decryption_deadline` for the room key.
+async fn notification_client_with_deadline(
+    client: &matrix_sdk::Client,
+    decryption_deadline: Duration,
+) -> NotificationClient {
+    NotificationClient::new(client.clone(), NotificationProcessSetup::MultipleProcesses)
+        .await
+        .unwrap()
+        .with_timeouts(NotificationClientTimeouts { decryption_deadline, ..Default::default() })
+}
+
+/// How long to wait for a room key that is not going to arrive.
+const QUICK: Duration = Duration::from_millis(50);
+
+/// Fetch the notification of `event` through the sliding sync path, the
+/// homeserver answering with `event` in the timeline of the room.
+async fn notification_with_sliding_sync(
+    server: &MatrixMockServer,
+    client: &matrix_sdk::Client,
+    room_id: &RoomId,
+    event_id: &ruma::EventId,
+    event: Raw<AnySyncTimelineEvent>,
+    decryption_deadline: Duration,
+) -> Box<matrix_sdk_ui::notification_client::NotificationItem> {
+    let mut room = response::Room::new();
+    room.timeline = vec![event];
+    let rooms = BTreeMap::from_iter([(room_id.to_owned(), room)]);
+
+    server
+        .mock_sliding_sync()
+        .ok(assign!(Response::new("1".to_owned()), {
+            rooms: rooms,
+        }))
+        .mount()
+        .await;
+    server.mock_room_state_encryption().encrypted().mount().await;
+
+    let notification_client = notification_client_with_deadline(client, decryption_deadline).await;
+    let status = notification_client
+        .get_notification_with_sliding_sync(room_id, event_id)
+        .await
+        .expect("could not get the notification");
+
+    assert_let!(NotificationStatus::Event(item) = status);
+    item
+}
+
+#[async_test]
+async fn test_notification_sliding_sync_reports_a_clear_event_as_not_encrypted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let event_id = event_id!("$clear:example.org");
+    let event = EventFactory::new()
+        .room(room_id)
+        .sender(user_id!("@user:example.org"))
+        .text_msg("Hello in the clear")
+        .event_id(event_id)
+        .into_raw_sync();
+
+    let item =
+        notification_with_sliding_sync(&server, &client, room_id, event_id, event, QUICK).await;
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::NotEncrypted);
+}
+
+#[async_test]
+async fn test_notification_sliding_sync_reports_a_decrypted_event_as_decrypted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    import_encrypted_event_session_key(&client).await;
+
+    let room_id = RoomId::parse(ENCRYPTED_EVENT_ROOM_ID).unwrap();
+    let event_id = event_id!("$encrypted:morpheus.localhost");
+    let event = encrypted_event_builder(event_id).into_raw_sync();
+
+    let item =
+        notification_with_sliding_sync(&server, &client, &room_id, event_id, event, QUICK).await;
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::Decrypted);
+    // The decrypted payload is what the notification carries.
+    assert_let!(NotificationEvent::Timeline(event) = &item.event);
+    assert_eq!(event.event_type(), TimelineEventType::RoomMessage);
+}
+
+/// The sliding sync receives the event undecrypted, and the room key arrives
+/// while the notification client retries the decryption.
+#[async_test]
+async fn test_notification_sliding_sync_reports_an_event_decrypted_on_retry_as_decrypted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = RoomId::parse(ENCRYPTED_EVENT_ROOM_ID).unwrap();
+    let event_id = event_id!("$encrypted:morpheus.localhost");
+    let event = encrypted_event_builder(event_id).into_raw_sync();
+
+    let key_client = client.clone();
+    let key_import = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        import_encrypted_event_session_key(&key_client).await;
+    });
+
+    let item = notification_with_sliding_sync(
+        &server,
+        &client,
+        &room_id,
+        event_id,
+        event,
+        Duration::from_secs(10),
+    )
+    .await;
+    key_import.await.unwrap();
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::Decrypted);
+    assert_let!(NotificationEvent::Timeline(event) = &item.event);
+    assert_eq!(event.event_type(), TimelineEventType::RoomMessage);
+}
+
+#[async_test]
+async fn test_notification_sliding_sync_reports_an_undecryptable_event_as_unable_to_decrypt() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    // No session key: the event can't be decrypted.
+
+    let room_id = RoomId::parse(ENCRYPTED_EVENT_ROOM_ID).unwrap();
+    let event_id = event_id!("$encrypted:morpheus.localhost");
+    let event = encrypted_event_builder(event_id).into_raw_sync();
+
+    let item =
+        notification_with_sliding_sync(&server, &client, &room_id, event_id, event, QUICK).await;
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::UnableToDecrypt);
+    assert_let!(NotificationEvent::Timeline(event) = &item.event);
+    assert_eq!(event.event_type(), TimelineEventType::RoomEncrypted);
+}
+
+/// Fetch the notification of `event` through the `/context` path, the
+/// homeserver answering with `event` as the focused event.
+async fn notification_with_context(
+    server: &MatrixMockServer,
+    client: &matrix_sdk::Client,
+    room_id: &RoomId,
+    event_id: &ruma::EventId,
+    event: matrix_sdk::deserialized_responses::TimelineEvent,
+) -> Box<matrix_sdk_ui::notification_client::NotificationItem> {
+    server.sync_room(client, JoinedRoomBuilder::new(room_id)).await;
+
+    server
+        .mock_room_event_context()
+        .ok(RoomContextResponseTemplate::new(event))
+        .mock_once()
+        .mount()
+        .await;
+    server.mock_room_state_encryption().encrypted().mount().await;
+
+    let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
+    let notification_client = NotificationClient::new(
+        client.clone(),
+        NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service },
+    )
+    .await
+    .unwrap();
+
+    let status = notification_client
+        .get_notification_with_context(room_id, event_id)
+        .await
+        .expect("could not get the notification");
+
+    assert_let!(NotificationStatus::Event(item) = status);
+    item
+}
+
+#[async_test]
+async fn test_notification_context_reports_a_clear_event_as_not_encrypted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let event_id = event_id!("$clear:example.org");
+    let event = EventFactory::new()
+        .room(room_id)
+        .sender(user_id!("@user:example.org"))
+        .text_msg("Hello in the clear")
+        .event_id(event_id)
+        .into_event();
+
+    let item = notification_with_context(&server, &client, room_id, event_id, event).await;
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::NotEncrypted);
+}
+
+/// `/context` decrypts the event before the notification client sees it, so
+/// the event handed over is not an `m.room.encrypted` one any more: the
+/// encryption must still be reported as `Decrypted`.
+#[async_test]
+async fn test_notification_context_reports_a_decrypted_event_as_decrypted() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    import_encrypted_event_session_key(&client).await;
+
+    let room_id = RoomId::parse(ENCRYPTED_EVENT_ROOM_ID).unwrap();
+    let event_id = event_id!("$encrypted:morpheus.localhost");
+    let event = encrypted_event_builder(event_id).into_event();
+
+    let item = notification_with_context(&server, &client, &room_id, event_id, event).await;
+
+    assert_eq!(item.event_encryption, NotificationEventEncryption::Decrypted);
+    assert_let!(NotificationEvent::Timeline(event) = &item.event);
+    assert_eq!(event.event_type(), TimelineEventType::RoomMessage);
 }
