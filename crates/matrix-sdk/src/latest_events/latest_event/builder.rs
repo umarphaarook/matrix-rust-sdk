@@ -102,7 +102,7 @@ impl Builder {
                             let original_encryption_info = event.kind.encryption_info();
 
                             let replacement = edit.kind.raw();
-                            let replacement_encryption_info = event.kind.encryption_info();
+                            let replacement_encryption_info = edit.kind.encryption_info();
 
                             Some(
                                 match check_validity_of_replacement_events(

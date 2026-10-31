@@ -245,3 +245,34 @@ async fn test_late_room_key_turns_a_hidden_undecryptable_event_into_decrypted() 
     // The redecrypted event becomes the latest event, labelled as decrypted.
     rig.wait_for(NotificationEventEncryption::Decrypted).await;
 }
+/// A clear `m.replace` of an encrypted message, as a homeserver could inject
+/// it, is not a valid replacement (the rust SDK's `ReplacementNotEncrypted`):
+/// the original stays the latest event.
+#[async_test]
+async fn test_clear_edit_of_an_encrypted_message_is_not_the_latest_event() {
+    use ruma::events::room::message::RoomMessageEventContent;
+    let rig = rig(true).await;
+    rig.listen().await;
+    rig.deliver_room_key().await;
+    rig.deliver(rig.encrypted_event.clone()).await;
+    rig.wait_for(NotificationEventEncryption::Decrypted).await;
+
+    // A clear `m.replace` of Alice's encrypted message, as a homeserver would
+    // inject it.
+    let forged_edit = EventFactory::new()
+        .room(room_id!("!test:localhost"))
+        .sender(user_id!("@alice:localhost"))
+        .text_msg("* forged")
+        .edit(event_id!("$secret"), RoomMessageEventContent::text_plain("forged").into())
+        .event_id(event_id!("$forged_edit"))
+        .server_ts(2)
+        .into_raw_sync();
+    rig.deliver(forged_edit).await;
+    sleep(Duration::from_millis(500)).await;
+
+    let latest = rig.bob_room.latest_event().await;
+    assert_matches!(latest, LatestEventValue::Remote { event_encryption, content, event_id, .. });
+    assert_eq!(event_encryption, Some(NotificationEventEncryption::Decrypted));
+    assert_eq!(content.as_message().map(|m| m.body().to_owned()), Some("secret".to_owned()));
+    assert_eq!(event_id.as_deref(), Some(event_id!("$secret")));
+}
