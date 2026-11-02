@@ -56,6 +56,60 @@ async fn test_sent_in_clear_shield() {
     );
 }
 
+/// On native, the "sent in clear" shield follows the text on screen: it clears
+/// once the sender's encrypted edit of a clear message lands (ADR-0038,
+/// Amendment). Web keeps it on the original. This pins the native behaviour.
+#[async_test]
+async fn test_sent_in_clear_shield_clears_once_the_senders_encrypted_edit_lands() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let mut stream = timeline.subscribe().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+
+    timeline
+        .handle_live_event(f.text_msg("Unencrypted message.").sender(&ALICE).event_id(original_id))
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    assert_eq!(
+        item.as_event().unwrap().get_shield(false),
+        TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+    );
+    // The date divider comes in late.
+    assert_next_matches!(stream, VectorDiff::PushFront { .. });
+
+    let encryption_info = Arc::new(EncryptionInfo {
+        sender: (*ALICE).into(),
+        sender_device: None,
+        forwarder: None,
+        algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+            curve25519_key: "fake_key".to_owned(),
+            sender_claimed_keys: BTreeMap::new(),
+            session_id: Some("fake_session".to_owned()),
+        },
+        verification_state: VerificationState::Verified,
+    });
+    let encrypted_edit = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: f
+                .text_msg("* Edited.")
+                .sender(&ALICE)
+                .edit(original_id, RoomMessageEventContent::text_plain("Edited.").into())
+                .event_id(event_id!("$edit"))
+                .room(&DEFAULT_TEST_ROOM_ID)
+                .into_raw_timeline(),
+            encryption_info,
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
+    timeline.handle_live_event(encrypted_edit).await;
+
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    let item = item.as_event().unwrap();
+    assert_eq!(item.content().as_message().unwrap().body(), "Edited.");
+    assert_eq!(item.get_shield(false), TimelineEventShieldState::None);
+}
+
 #[async_test]
 /// Note: This is a regression test for a bug where the SentInClear shield was
 /// incorrectly shown on a local echo whilst sending and was then removed once
