@@ -61,8 +61,8 @@ impl Builder {
         let mut room_has_been_emptied = true;
         let mut current_value_must_be_erased = false;
 
-        // Track the most recent edit for each event.
-        let mut latest_edit_for_event: HashMap<OwnedEventId, TimelineEvent> = HashMap::new();
+        // Track the edits of each event, newest first (the scan goes backwards).
+        let mut edits_for_event: HashMap<OwnedEventId, Vec<TimelineEvent>> = HashMap::new();
 
         if let Ok(Some(event)) = room_event_cache
             .rfind_map_event_in_memory_by(|event| {
@@ -83,9 +83,9 @@ impl Builder {
                         current_value_must_be_erased = erased;
 
                         if let Some(edited_event_id) = edited_event_id {
-                            // This is an edit. Store it if we haven't seen an edit for the
-                            // targeted event yet.
-                            latest_edit_for_event.entry(edited_event_id).or_insert(event.clone());
+                            // This is an edit. Keep every one: an invalid (forged) newer
+                            // edit must not hide an earlier valid one.
+                            edits_for_event.entry(edited_event_id).or_default().push(event.clone());
                         }
 
                         None
@@ -93,33 +93,33 @@ impl Builder {
 
                     // Stop! We found a suitable event!
                     ControlFlow::Break(()) => {
-                        // Return the latest known edit of the event or the event itself if it
-                        // hasn't been replaced or the replacement is invalid.
+                        // Return the latest VALID edit of the event or the event itself if
+                        // it hasn't been replaced or no replacement is valid.
                         if let Some(event_id) = event.event_id()
-                            && let Some(edit) = latest_edit_for_event.get(event_id)
+                            && let Some(edits) = edits_for_event.get(event_id)
                         {
                             let original = event.kind.raw();
                             let original_encryption_info = event.kind.encryption_info();
 
-                            let replacement = edit.kind.raw();
-                            let replacement_encryption_info = edit.kind.encryption_info();
-
-                            Some(
+                            // `edits` is newest first, so the first valid one is the latest.
+                            let latest_valid_edit = edits.iter().find(|edit| {
                                 match check_validity_of_replacement_events(
                                     original,
                                     original_encryption_info.map(|e| &(**e)),
-                                    replacement,
-                                    replacement_encryption_info.map(|e| &(**e)),
+                                    edit.kind.raw(),
+                                    edit.kind.encryption_info().map(|e| &(**e)),
                                 ) {
-                                    Ok(_) => edit.clone(),
+                                    Ok(_) => true,
                                     Err(e) => {
                                         debug!(
-                                        "Skipping an edit of a latest event due to the replacement event being invalid: {e}"
-                                    );
-                                        event.clone()
+                                            "Skipping an edit of a latest event due to the replacement event being invalid: {e}"
+                                        );
+                                        false
                                     }
-                                },
-                            )
+                                }
+                            });
+
+                            Some(latest_valid_edit.unwrap_or(event).clone())
                         } else {
                             Some(event.clone())
                         }

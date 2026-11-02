@@ -821,6 +821,79 @@ async fn test_notification_client_sliding_sync_invites_with_event_id() {
     assert_eq!(item.is_noisy, Some(false));
 }
 
+/// An invite event of one room must not answer a request about another room,
+/// even when the event ids match: the homeserver picks the event ids it sends.
+#[async_test]
+async fn test_notification_client_invite_event_id_from_another_room_is_ignored() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let invite_room_id = room_id!("!a98sd12bjh2:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let invite_event_id = event_id!("$invite_event_id");
+    let other_event_id = event_id!("$other_event_id");
+    let sender = user_id!("@user:example.org");
+    let my_user_id = client.user_id().unwrap().to_owned();
+
+    let event_factory = EventFactory::new().room(invite_room_id);
+    let sender_member_event =
+        event_factory.member(sender).membership(MembershipState::Join).into_raw_sync();
+    let invite_member_event = event_factory
+        .member(&my_user_id)
+        .membership(MembershipState::Invite)
+        .sender(sender)
+        .event_id(invite_event_id)
+        .into_raw_sync();
+
+    Mock::given(SlidingSyncMatcher)
+        .respond_with(move |request: &Request| {
+            let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "txn_id": partial_request.txn_id,
+                "pos": "1",
+                "rooms": {
+                    invite_room_id: {
+                        "name": "invite room",
+                        "initial": true,
+                        "invite_state": [sender_member_event, invite_member_event],
+                        "timeline": [],
+                    }
+                },
+                "extensions": { "account_data": {} }
+            }))
+        })
+        .mount(server.server())
+        .await;
+
+    let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
+    let process_setup =
+        NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service };
+    let notification_client = NotificationClient::new(client, process_setup).await.unwrap();
+
+    // The batch spans two rooms: `room_id` asks for an event id which, in the
+    // sync, belongs to an invite of `invite_room_id`.
+    let result = notification_client
+        .get_notifications_with_sliding_sync(&[
+            NotificationItemsRequest {
+                room_id: room_id.to_owned(),
+                event_ids: vec![invite_event_id.to_owned()],
+            },
+            NotificationItemsRequest {
+                room_id: invite_room_id.to_owned(),
+                event_ids: vec![other_event_id.to_owned()],
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_matches!(
+        result.get(invite_event_id),
+        None | Some(Ok(NotificationStatus::EventNotFound))
+            | Some(Ok(NotificationStatus::EventFilteredOut)),
+        "an invite of another room must not answer the request"
+    );
+}
+
 #[async_test]
 async fn test_notification_client_mixed() {
     let room_id = room_id!("!a98sd12bjh:example.org");
@@ -1447,7 +1520,10 @@ async fn mount_sliding_sync_delivering_the_session_key(
                     import_encrypted_event_session_key(&client).await;
                     done_sender.send(()).unwrap();
                 });
-                done_receiver.recv().unwrap();
+                // A deadlock must fail the test instead of hanging it.
+                done_receiver
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the session key import should finish");
             } else if let Some((room_id, event)) = &notified_room {
                 rooms = json!({ room_id.to_string(): { "timeline": [event] } });
             }

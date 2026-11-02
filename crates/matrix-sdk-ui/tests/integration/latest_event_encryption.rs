@@ -30,6 +30,8 @@ struct Rig {
     bob_room: Room,
     /// Alice's encrypted event, as the server would deliver it to Bob.
     encrypted_event: Raw<AnySyncTimelineEvent>,
+    /// Alice's encrypted, legitimate `m.replace` of that message ("edited").
+    encrypted_edit: Raw<AnySyncTimelineEvent>,
     /// The to-device event carrying the room key for that message.
     room_key: Raw<ruma::events::AnyToDeviceEvent>,
 }
@@ -117,7 +119,34 @@ async fn rig(room_is_encrypted: bool) -> Rig {
     let encrypted_event = event_receiver.await.unwrap();
     let room_key = room_key.await;
 
-    Rig { server, bob, bob_room, encrypted_event, room_key: room_key.cast_unchecked() }
+    // Alice then edits her message; the edit is encrypted with the same session.
+    let (edit_receiver, edit_mock) =
+        server.mock_room_send().ok_with_capture(event_id!("$edit"), alice_user_id);
+    {
+        let _guard = edit_mock.mock_once().mount_as_scoped().await;
+        alice_room
+            .send_raw(
+                "m.room.message",
+                serde_json::json!({
+                    "body": "* edited",
+                    "msgtype": "m.text",
+                    "m.new_content": {"body": "edited", "msgtype": "m.text"},
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$secret"},
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let encrypted_edit = edit_receiver.await.unwrap();
+
+    Rig {
+        server,
+        bob,
+        bob_room,
+        encrypted_event,
+        encrypted_edit,
+        room_key: room_key.cast_unchecked(),
+    }
 }
 
 impl Rig {
@@ -157,6 +186,19 @@ impl Rig {
             sleep(Duration::from_millis(20)).await;
         }
         panic!("the room never got a remote latest event");
+    }
+
+    /// Wait for the latest event's message body to become `expected`.
+    async fn wait_for_body(&self, expected: &str) {
+        for _ in 0..100 {
+            if let LatestEventValue::Remote { content, .. } = self.bob_room.latest_event().await
+                && content.as_message().map(|m| m.body().to_owned()).as_deref() == Some(expected)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the latest event never had the body {expected:?}");
     }
 
     /// Wait for the label to become `expected` (a redecryption re-emits it).
@@ -275,4 +317,38 @@ async fn test_clear_edit_of_an_encrypted_message_is_not_the_latest_event() {
     assert_eq!(event_encryption, Some(NotificationEventEncryption::Decrypted));
     assert_eq!(content.as_message().map(|m| m.body().to_owned()), Some("secret".to_owned()));
     assert_eq!(event_id.as_deref(), Some(event_id!("$secret")));
+}
+
+/// A forged clear `m.replace` injected after a legitimate encrypted edit must
+/// not hide that edit: the latest event is the newest VALID edit, not the
+/// original and not the forgery.
+#[async_test]
+async fn test_forged_edit_does_not_hide_an_earlier_valid_edit() {
+    use ruma::events::room::message::RoomMessageEventContent;
+    let rig = rig(true).await;
+    rig.listen().await;
+    rig.deliver_room_key().await;
+    rig.deliver(rig.encrypted_event.clone()).await;
+    rig.wait_for(NotificationEventEncryption::Decrypted).await;
+
+    rig.deliver(rig.encrypted_edit.clone()).await;
+    rig.wait_for_body("edited").await;
+
+    let forged_edit = EventFactory::new()
+        .room(room_id!("!test:localhost"))
+        .sender(user_id!("@alice:localhost"))
+        .text_msg("* forged")
+        .edit(event_id!("$secret"), RoomMessageEventContent::text_plain("forged").into())
+        .event_id(event_id!("$forged_edit"))
+        .server_ts(3)
+        .into_raw_sync();
+    rig.deliver(forged_edit).await;
+    sleep(Duration::from_millis(500)).await;
+
+    assert_matches!(
+        rig.bob_room.latest_event().await,
+        LatestEventValue::Remote { event_encryption, content, .. }
+    );
+    assert_eq!(event_encryption, Some(NotificationEventEncryption::Decrypted));
+    assert_eq!(content.as_message().map(|m| m.body().to_owned()), Some("edited".to_owned()));
 }

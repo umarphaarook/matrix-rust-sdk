@@ -620,8 +620,12 @@ impl NotificationClient {
                 // shouldn't receive it, so that's a first attempt.
                 match &raw.get_field::<OwnedEventId>("event_id") {
                     Ok(Some(event_id)) => {
-                        let request =
-                            &requests.iter().find(|request| request.event_ids.contains(event_id));
+                        // Only take the event from the room the notification is about,
+                        // as the timeline handler does: a batch can span rooms.
+                        let request = &requests.iter().find(|request| {
+                            request.room_id == room.room_id()
+                                && request.event_ids.contains(event_id)
+                        });
                         if request.is_none() {
                             return;
                         }
