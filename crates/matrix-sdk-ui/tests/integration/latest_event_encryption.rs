@@ -13,10 +13,14 @@ use matrix_sdk::{
 use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::{
     notification_client::NotificationEventEncryption,
-    timeline::{LatestEventValue, RoomExt as _},
+    timeline::{EventTimelineItem, LatestEventValue, RoomExt as _, Timeline},
 };
 use ruma::{
-    RoomVersionId, device_id, event_id, events::AnySyncTimelineEvent, room_id, serde::Raw, user_id,
+    EventId, RoomVersionId, device_id, event_id,
+    events::{AnySyncTimelineEvent, room::message::RoomMessageEventContent},
+    room_id,
+    serde::Raw,
+    user_id,
 };
 use tokio::time::sleep;
 
@@ -351,4 +355,72 @@ async fn test_forged_edit_does_not_hide_an_earlier_valid_edit() {
     );
     assert_eq!(event_encryption, Some(NotificationEventEncryption::Decrypted));
     assert_eq!(content.as_message().map(|m| m.body().to_owned()), Some("edited".to_owned()));
+}
+
+/// Alice's clear `m.replace` of `target`, as a homeserver could inject it.
+fn clear_edit(target: &EventId, id: &EventId, body: &str) -> Raw<AnySyncTimelineEvent> {
+    EventFactory::new()
+        .room(room_id!("!test:localhost"))
+        .sender(user_id!("@alice:localhost"))
+        .text_msg("* clear edit")
+        .edit(target, RoomMessageEventContent::text_plain(body).into())
+        .event_id(id)
+        .server_ts(3)
+        .into_raw_sync()
+}
+
+/// Wait for the timeline item `id` to show `expected` as its body.
+async fn wait_body(timeline: &Timeline, id: &EventId, expected: &str) -> EventTimelineItem {
+    let mut shown = None;
+    for _ in 0..150 {
+        let items = timeline.items().await;
+        let item = items.iter().filter_map(|i| i.as_event()).find(|e| e.event_id() == Some(id));
+        if let Some(item) = item {
+            let body = item.content().as_message().map(|m| m.body().to_owned());
+            if body.as_deref() == Some(expected) {
+                return item.clone();
+            }
+            shown = body;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timeline {id} never showed {expected:?}: now {shown:?}");
+}
+
+/// Encrypted original, valid encrypted edit, then a newer clear edit: the
+/// timeline and the chat list both keep the valid edit.
+#[async_test]
+async fn test_encrypted_original_clear_edit_after_valid_edit_is_refused_live() {
+    let rig = rig(true).await;
+    rig.listen().await;
+    let timeline = rig.bob_room.timeline().await.unwrap();
+    rig.deliver_room_key().await;
+    rig.deliver(rig.encrypted_event.clone()).await;
+    wait_body(&timeline, event_id!("$secret"), "secret").await;
+    rig.deliver(rig.encrypted_edit.clone()).await;
+    let item = wait_body(&timeline, event_id!("$secret"), "edited").await;
+    assert!(item.encryption_info().is_some());
+
+    rig.deliver(clear_edit(event_id!("$secret"), event_id!("$f"), "forged")).await;
+    sleep(Duration::from_millis(400)).await;
+    let item = wait_body(&timeline, event_id!("$secret"), "edited").await;
+    assert!(item.encryption_info().is_some());
+    rig.wait_for_body("edited").await;
+    rig.wait_for(NotificationEventEncryption::Decrypted).await;
+}
+
+/// Encrypted original with ONLY a clear edit: the original on both surfaces.
+#[async_test]
+async fn test_encrypted_original_only_clear_edit_is_refused() {
+    let rig = rig(true).await;
+    rig.listen().await;
+    let timeline = rig.bob_room.timeline().await.unwrap();
+    rig.deliver_room_key().await;
+    rig.deliver(rig.encrypted_event.clone()).await;
+    wait_body(&timeline, event_id!("$secret"), "secret").await;
+    rig.deliver(clear_edit(event_id!("$secret"), event_id!("$f"), "forged")).await;
+    sleep(Duration::from_millis(400)).await;
+    let item = wait_body(&timeline, event_id!("$secret"), "secret").await;
+    assert!(!item.content().as_message().unwrap().is_edited());
+    rig.wait_for_body("secret").await;
 }

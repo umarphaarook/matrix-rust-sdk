@@ -58,7 +58,7 @@ use ruma::{
     room_version_rules::RoomVersionRules,
     serde::Raw,
 };
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::{ObservableItemsTransaction, rfind_event_by_item_id};
 use crate::timeline::{
@@ -1097,7 +1097,7 @@ fn is_valid_remote_edit(item: &EventTimelineItem, edit: &PendingEdit) -> bool {
     ) {
         Ok(_) => true,
         Err(e) => {
-            warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
+            debug!("Event wasn't replaced due to the replacement event being invalid: {e}");
             false
         }
     }
