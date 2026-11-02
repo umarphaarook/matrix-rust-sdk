@@ -4,8 +4,8 @@ use matrix_sdk::{
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     test_utils::mocks::MatrixMockServer,
 };
-use matrix_sdk_test::{async_test, event_factory::EventFactory};
-use ruma::{event_id, owned_room_id, user_id};
+use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use ruma::{event_id, events::room::message::RoomMessageEventContent, owned_room_id, user_id};
 use tokio::task::yield_now;
 
 #[async_test]
@@ -78,4 +78,81 @@ async fn test_latest_event_is_recomputed_when_a_user_is_ignored() {
 
     // The latest event is reset to `None` because the room has been cleared.
     assert_matches!(latest_event_stream.next().await, Some(LatestEventValue::None));
+}
+
+/// Wait, at most 5 seconds, for the latest event of the room to be the event
+/// `expected`.
+async fn wait_for_latest_event(
+    stream: &mut eyeball::Subscriber<LatestEventValue, eyeball::AsyncLock>,
+    expected: &ruma::EventId,
+) {
+    let wait = async {
+        loop {
+            let Some(value) = stream.next().await else { panic!("the stream ended") };
+            if value.event_id().as_deref() == Some(expected) {
+                return;
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.is_err() {
+        panic!("the latest event never was {expected}, it is {:?}", stream.next_now().await.event_id());
+    }
+}
+
+/// B's original, B's early edit, B's late edit and C's forged edit reach the
+/// room by sync; the late edit is then redacted by sync. The chat list's
+/// latest event must go back to the early edit, not stay on the late one.
+#[async_test]
+async fn test_latest_event_after_the_newest_edit_is_redacted() {
+    let room_id = owned_room_id!("!r0");
+    let bob = user_id!("@bob:local");
+    let carol = user_id!("@carol:local");
+    let original = event_id!("$original");
+    let early = event_id!("$early");
+    let late = event_id!("$late");
+    let forged = event_id!("$forged");
+    let event_factory = EventFactory::new().room(&room_id).sender(bob);
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let _room = server.sync_joined_room(&client, &room_id).await;
+    let mut stream =
+        client.latest_events().await.listen_and_subscribe_to_room(&room_id).await.unwrap().unwrap();
+
+    let edit = |id: &ruma::EventId, body: &str, sender: &ruma::UserId| {
+        event_factory
+            .text_msg(format!("* {body}"))
+            .sender(sender)
+            .edit(original, RoomMessageEventContent::text_plain(body).into())
+            .event_id(id)
+    };
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |sync_builder| {
+            sync_builder.add_joined_room(
+                JoinedRoomBuilder::new(&room_id)
+                    .add_timeline_event(event_factory.text_msg("original").event_id(original))
+                    .add_timeline_event(edit(early, "early", bob))
+                    .add_timeline_event(edit(late, "late", bob))
+                    .add_timeline_event(edit(forged, "forged", carol)),
+            );
+        })
+        .await;
+
+    // The forged edit is ignored: the late edit is the latest event.
+    wait_for_latest_event(&mut stream, late).await;
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |sync_builder| {
+            sync_builder.add_joined_room(
+                JoinedRoomBuilder::new(&room_id).add_timeline_event(event_factory.redaction(late)),
+            );
+        })
+        .await;
+
+    wait_for_latest_event(&mut stream, early).await;
 }
