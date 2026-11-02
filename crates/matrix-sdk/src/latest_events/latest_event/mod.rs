@@ -817,6 +817,115 @@ mod tests_latest_event {
         }
     }
 
+    /// B's original, B's early edit, B's late edit and C's forged edit; then
+    /// the late edit is redacted. The latest event goes back to the early edit:
+    /// the redacted text must not stay on the chat list.
+    #[async_test]
+    async fn test_redacted_latest_edit_falls_back_to_the_previous_valid_edit() {
+        let room_id = owned_room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(&room_id);
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.base_client().get_or_create_room(&room_id, RoomState::Joined);
+        let _room = client.get_room(&room_id).unwrap();
+        let weak_room = WeakRoom::new(WeakClient::from_client(&client), room_id.clone());
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let original = event_id!("$original");
+        let early = event_id!("$early");
+        let late = event_id!("$late");
+        let forged = event_id!("$forged");
+
+        client
+            .event_cache_store()
+            .lock()
+            .await
+            .expect("Could not acquire the event cache lock")
+            .as_clean()
+            .expect("Could not acquire a clean event cache lock")
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(&room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![
+                            event_factory.text_msg("original").event_id(original).into(),
+                            event_factory
+                                .text_msg("* early")
+                                .edit(original, RoomMessageEventContent::text_plain("early").into())
+                                .event_id(early)
+                                .into(),
+                            event_factory
+                                .text_msg("* late")
+                                .edit(original, RoomMessageEventContent::text_plain("late").into())
+                                .event_id(late)
+                                .into(),
+                            event_factory
+                                .text_msg("* forged")
+                                .edit(
+                                    original,
+                                    RoomMessageEventContent::text_plain("forged").into(),
+                                )
+                                .sender(user_id!("@malory:example.org"))
+                                .event_id(forged)
+                                .into(),
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let (room_event_cache, _) = event_cache.room(&room_id).await.unwrap();
+
+        let mut latest_event = LatestEvent::new(&weak_room, None);
+
+        // The forged edit is skipped, the late one is the latest event.
+        {
+            latest_event.update_with_event_cache(&room_event_cache, user_id, None).await;
+
+            assert_matches!(
+                latest_event.current_value.get().await,
+                LatestEventValue::Remote(remote) => {
+                    assert_eq!(remote.event_id(), Some(late));
+                }
+            );
+        }
+
+        // Redact the late edit.
+        {
+            server
+                .mock_sync()
+                .ok_and_run(&client, |builder| {
+                    builder.add_joined_room(
+                        JoinedRoomBuilder::new(&room_id)
+                            .add_timeline_event(event_factory.redaction(late)),
+                    );
+                })
+                .await;
+
+            yield_now().await;
+
+            latest_event.update_with_event_cache(&room_event_cache, user_id, None).await;
+
+            assert_matches!(
+                latest_event.current_value.get().await,
+                LatestEventValue::Remote(remote) => {
+                    assert_eq!(remote.event_id(), Some(early));
+                }
+            );
+        }
+    }
+
     #[async_test]
     async fn test_store_latest_event_value() {
         let room_id = owned_room_id!("!r0");
