@@ -467,6 +467,35 @@ mod tests {
         })
     }
 
+    /// An edit of a poll previews as the poll it makes, not as an empty value.
+    #[async_test]
+    async fn test_remote_poll_edit() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_room(&client, JoinedRoomBuilder::new(room_id!("!r0"))).await;
+        let sender = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new();
+
+        let base_value = BaseLatestEventValue::Remote(RemoteLatestEventValue::from_plaintext(
+            event_factory
+                .server_ts(42)
+                .sender(sender)
+                .poll_edit(event_id!("$ev0"), "raclette or fondue?", vec!["raclette", "fondue"])
+                .event_id(event_id!("$ev1"))
+                .into_raw_sync(),
+        ));
+        let value =
+            LatestEventValue::from_base_latest_event_value(base_value, &room, &client).await;
+
+        assert_matches!(value, LatestEventValue::Remote { event_id, content, .. } => {
+            assert_eq!(event_id.as_deref(), Some(event_id!("$ev1")));
+            let poll = content.as_poll().expect("the content is a poll");
+            let results = poll.results();
+            assert_eq!(results.question, "raclette or fondue?");
+            assert_eq!(results.answers.len(), 2);
+        })
+    }
+
     #[async_test]
     async fn test_remote_beacon_stop() {
         let server = MatrixMockServer::new().await;

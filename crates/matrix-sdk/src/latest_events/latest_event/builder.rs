@@ -27,6 +27,7 @@ use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, TransactionId, UserId,
     events::{
         AnyMessageLikeEventContent, AnySyncStateEvent, AnySyncTimelineEvent, SyncStateEvent,
+        poll::unstable_start::UnstablePollStartEventContent,
         relation::Replacement,
         room::{
             member::MembershipChange,
@@ -731,6 +732,17 @@ fn filter_any_message_like_event_content(
             }
         }
 
+        // `org.matrix.msc3381.poll.start`, an edit of a poll
+        AnyMessageLikeEventContent::UnstablePollStart(
+            UnstablePollStartEventContent::Replacement(replacement),
+        ) => {
+            // Same as the edit of a message above: suitable if and only if the targeted
+            // poll is. Not a candidate by itself, otherwise the latest event would be an
+            // edit that nothing can turn into a preview when it is forged, or targets an
+            // older poll.
+            filter_continue_with_edit(replacement.relates_to.event_id)
+        }
+
         // `org.matrix.msc3381.poll.start`
         // `m.call.invite`
         // `m.rtc.notification`
@@ -970,6 +982,23 @@ mod filter_tests {
                     .into_event()
             }
             is a candidate
+        );
+    }
+
+    #[test]
+    fn test_poll_replacement() {
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id);
+        let event_id = event_id!("$ev0");
+        let event =
+            event_factory.poll_edit(event_id, "comté > gruyère", vec!["yes", "oui"]).into_event();
+
+        // An edit of a poll is not a candidate: it is remembered with the ID of the
+        // poll it targets, like the edit of a message.
+        assert_matches!(filter_timeline_event(&event, None, user_id, None), ControlFlow::Continue(FilterContinue { current_value_must_be_erased, edited_event_id }) => {
+                assert!(current_value_must_be_erased.not());
+                assert_eq!(edited_event_id, Some(event_id.to_owned()));
+            }
         );
     }
 
@@ -1683,13 +1712,14 @@ mod builder_tests {
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
         RoomState,
-        deserialized_responses::TimelineEventKind,
+        deserialized_responses::{TimelineEvent, TimelineEventKind},
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         store::{ChildTransactionId, SerializableEventContent},
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
-        EventId, MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedTransactionId, event_id,
+        EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedTransactionId, RoomId,
+        event_id,
         events::{
             AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             SyncMessageLikeEvent, reaction::ReactionEventContent, relation::Annotation,
@@ -2646,6 +2676,243 @@ mod builder_tests {
             Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None)
                 .await
                 .is_none()
+        );
+    }
+
+    /// Put `events` in the event cache of the room `room_id`, in this order,
+    /// and return what is needed to compute a latest event value from them.
+    async fn room_event_cache_with(
+        room_id: &RoomId,
+        events: Vec<TimelineEvent>,
+    ) -> (MatrixMockServer, Client, RoomEventCache) {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+
+        client
+            .event_cache_store()
+            .lock()
+            .await
+            .expect("Could not acquire the event cache lock")
+            .as_clean()
+            .expect("Could not acquire a clean event cache lock")
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: events,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let (room_event_cache, _) = event_cache.room(room_id).await.unwrap();
+
+        (server, client, room_event_cache)
+    }
+
+    /// The ID of the event a remote latest event value is made of.
+    fn remote_event_id(value: Option<LatestEventValue>) -> Option<OwnedEventId> {
+        let value = value.expect("a latest event value");
+        assert_matches!(value, LatestEventValue::Remote(_));
+        value.event_id()
+    }
+
+    #[async_test]
+    async fn test_remote_poll_edit_with_a_missing_target_is_not_the_latest_event() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory.text_msg("M").event_id(event_id!("$m")).into(),
+                // Anyone in the room can send this, the poll it edits doesn't exist.
+                event_factory
+                    .poll_edit(event_id!("$missing"), "forged?", vec!["yes", "no"])
+                    .sender(user_id!("@malory:example.org"))
+                    .event_id(event_id!("$forged"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$m"))
+        );
+    }
+
+    #[async_test]
+    async fn test_remote_poll_edit_of_the_newest_poll_is_the_latest_event() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory.text_msg("M").event_id(event_id!("$m")).into(),
+                event_factory
+                    .poll_start("old?", "old?", vec!["yes", "no"])
+                    .event_id(event_id!("$poll"))
+                    .into(),
+                event_factory
+                    .poll_edit(event_id!("$poll"), "new?", vec!["yes", "no"])
+                    .event_id(event_id!("$edit"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$edit"))
+        );
+    }
+
+    #[async_test]
+    async fn test_remote_poll_edit_of_an_older_poll_is_not_the_latest_event() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory
+                    .poll_start("old?", "old?", vec!["yes", "no"])
+                    .event_id(event_id!("$poll"))
+                    .into(),
+                event_factory.text_msg("M").event_id(event_id!("$m")).into(),
+                event_factory
+                    .poll_edit(event_id!("$poll"), "new?", vec!["yes", "no"])
+                    .event_id(event_id!("$edit"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$m"))
+        );
+    }
+
+    #[async_test]
+    async fn test_remote_poll_edit_of_someone_elses_poll_is_not_the_latest_event() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory
+                    .poll_start("old?", "old?", vec!["yes", "no"])
+                    .event_id(event_id!("$poll"))
+                    .into(),
+                event_factory
+                    .poll_edit(event_id!("$poll"), "forged?", vec!["yes", "no"])
+                    .sender(user_id!("@malory:example.org"))
+                    .event_id(event_id!("$forged"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        // The edit targets the newest poll, but it isn't the poll's sender.
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$poll"))
+        );
+    }
+
+    #[async_test]
+    async fn test_remote_forged_poll_edit_does_not_hide_an_earlier_valid_one() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory
+                    .poll_start("old?", "old?", vec!["yes", "no"])
+                    .event_id(event_id!("$poll"))
+                    .into(),
+                event_factory
+                    .poll_edit(event_id!("$poll"), "new?", vec!["yes", "no"])
+                    .event_id(event_id!("$edit"))
+                    .into(),
+                event_factory
+                    .poll_edit(event_id!("$poll"), "forged?", vec!["yes", "no"])
+                    .sender(user_id!("@malory:example.org"))
+                    .event_id(event_id!("$forged"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$edit"))
+        );
+    }
+
+    #[async_test]
+    async fn test_remote_message_edit_of_a_poll_is_not_the_latest_event() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(room_id);
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                event_factory
+                    .poll_start("old?", "old?", vec!["yes", "no"])
+                    .event_id(event_id!("$poll"))
+                    .into(),
+                // The type of an edit must be the type of the original.
+                event_factory
+                    .text_msg("* a message")
+                    .edit(
+                        event_id!("$poll"),
+                        RoomMessageEventContent::text_plain("a message").into(),
+                    )
+                    .event_id(event_id!("$mismatch"))
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_event_id(
+                Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
+            ),
+            Some(owned_event_id!("$poll"))
         );
     }
 

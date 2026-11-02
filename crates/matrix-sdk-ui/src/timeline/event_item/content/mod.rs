@@ -241,6 +241,25 @@ impl TimelineItemContent {
                     _ => None,
                 }
             }
+            [
+                TimelineAction::HandleAggregation {
+                    kind: HandleAggregationKind::PollEdit { replacement },
+                    ..
+                },
+            ] => {
+                // Map the edit to the poll it makes.
+                let new_content = replacement.new_content.clone();
+                Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                    kind: MsgLikeKind::Poll(PollState::new(
+                        new_content.poll_start,
+                        new_content.text,
+                    )),
+                    reactions: Default::default(),
+                    thread_root: None,
+                    in_reply_to: None,
+                    thread_summary: None,
+                }))
+            }
             [] => {
                 warn!("No action for event content processing");
                 None
