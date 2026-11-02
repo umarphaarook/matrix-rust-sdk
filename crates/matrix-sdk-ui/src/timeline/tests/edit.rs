@@ -25,11 +25,11 @@ use matrix_sdk_base::{
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent},
     store::QueueWedgeError,
 };
-use matrix_sdk_test::{ALICE, BOB, async_test};
+use matrix_sdk_test::{ALICE, BOB, DEFAULT_TEST_ROOM_ID, async_test};
 use ruma::{
     EventId, event_id,
     events::{
-        AnyMessageLikeEventContent,
+        AnyMessageLikeEventContent, AnyTimelineEvent,
         relation::Replacement,
         room::message::{
             MessageType, RedactedRoomMessageEventContent, Relation, RoomMessageEventContent,
@@ -37,11 +37,15 @@ use ruma::{
         },
     },
     owned_event_id, room_id,
+    serde::Raw,
 };
 use stream_assert::{assert_next_matches, assert_pending};
 
-use super::TestTimeline;
-use crate::timeline::{EventSendState, MediaUploadProgress};
+use super::{TestTimeline, TestTimelineBuilder};
+use crate::timeline::{
+    EventSendState, EventTimelineItem, MediaUploadProgress, TimelineEventShieldState,
+    TimelineEventShieldStateCode,
+};
 
 #[async_test]
 async fn test_live_redacted() {
@@ -602,4 +606,290 @@ async fn test_edit_remote_echo_before_sent_leaves_no_pending_state() {
     assert!(item.edit_send_state().is_none());
 
     assert_pending!(stream);
+}
+
+/// The encryption info of an event decrypted with the Megolm session
+/// `session_id`.
+fn encryption_info(session_id: &str, verification_state: VerificationState) -> Arc<EncryptionInfo> {
+    Arc::new(EncryptionInfo {
+        sender: (*ALICE).into(),
+        sender_device: None,
+        forwarder: None,
+        algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+            curve25519_key: "123".to_owned(),
+            sender_claimed_keys: BTreeMap::new(),
+            session_id: Some(session_id.to_owned()),
+        },
+        verification_state,
+    })
+}
+
+/// Make the event look like it was decrypted with the Megolm session
+/// `session_id`.
+fn decrypted(event: impl Into<Raw<AnyTimelineEvent>>, session_id: &str) -> TimelineEvent {
+    TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: event.into(),
+            encryption_info: encryption_info(session_id, VerificationState::Verified),
+            unsigned_encryption_info: None,
+        },
+        None,
+    )
+}
+
+/// The session the item was decrypted with, if it was decrypted.
+fn session_of(item: &EventTimelineItem) -> Option<String> {
+    match &item.encryption_info()?.algorithm_info {
+        AlgorithmInfo::MegolmV1AesSha2 { session_id, .. } => session_id.clone(),
+        _ => None,
+    }
+}
+
+async fn item_with_id(timeline: &TestTimeline, event_id: &EventId) -> EventTimelineItem {
+    let items = timeline.controller.items().await;
+    items
+        .iter()
+        .filter_map(|item| item.as_event())
+        .find(|item| item.event_id() == Some(event_id))
+        .unwrap_or_else(|| panic!("no timeline item for {event_id}"))
+        .clone()
+}
+
+fn body_of(item: &EventTimelineItem) -> String {
+    item.content().as_message().expect("a message").body().to_owned()
+}
+
+/// Redacting the only edit of a message puts the original back, with the
+/// encryption info of the original: the shield follows the text.
+#[async_test]
+async fn test_redacted_sole_edit_restores_the_original() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let edit_id = event_id!("$edit");
+    let clear_shield =
+        TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear };
+
+    timeline.handle_live_event(f.text_msg("original").sender(*ALICE).event_id(original_id)).await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "original");
+    assert!(item.encryption_info().is_none());
+    assert_eq!(item.get_shield(false), clear_shield);
+
+    // A clear original and an encrypted edit of it by its sender.
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* edited")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("edited").into())
+                .event_id(edit_id)
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_EDIT",
+        ))
+        .await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "edited");
+    assert_eq!(session_of(&item).as_deref(), Some("S_EDIT"));
+    assert_eq!(item.get_shield(false), TimelineEventShieldState::None);
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(*ALICE)).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "original");
+    assert!(!item.content().as_message().unwrap().is_edited());
+    assert!(item.latest_edit_json().is_none());
+    assert!(item.encryption_info().is_none());
+    assert_eq!(item.get_shield(false), clear_shield);
+}
+
+/// Same, with an encrypted original: the info of the original, not the one of
+/// the redacted edit.
+#[async_test]
+async fn test_redacted_sole_edit_restores_the_encryption_info_of_the_original() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let edit_id = event_id!("$edit");
+
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("original").sender(*ALICE).event_id(original_id).room(&DEFAULT_TEST_ROOM_ID),
+            "S_ORIGINAL",
+        ))
+        .await;
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* edited")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("edited").into())
+                .event_id(edit_id)
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_EDIT",
+        ))
+        .await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "edited");
+    assert_eq!(session_of(&item).as_deref(), Some("S_EDIT"));
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(*ALICE)).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "original");
+    assert_eq!(session_of(&item).as_deref(), Some("S_ORIGINAL"));
+}
+
+/// The remaining edits are all forged: the original comes back as well.
+#[async_test]
+async fn test_redacted_only_valid_edit_with_forged_edits_left_restores_the_original() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let edit_id = event_id!("$edit");
+
+    timeline.handle_live_event(f.text_msg("original").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("* edited")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("edited").into())
+                .event_id(edit_id),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            f.text_msg("* forged")
+                .sender(*BOB)
+                .edit(original_id, MessageType::text_plain("forged").into())
+                .event_id(event_id!("$forged")),
+        )
+        .await;
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "edited");
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(*ALICE)).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "original");
+    assert!(!item.content().as_message().unwrap().is_edited());
+}
+
+/// Redacting the newest edit puts back the one before it, whatever the
+/// encryption of the redacted edit was.
+#[async_test]
+async fn test_redacted_encrypted_edit_falls_back_to_the_clear_edit_before_it() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let e1_id = event_id!("$e1");
+    let e2_id = event_id!("$e2");
+
+    timeline.handle_live_event(f.text_msg("original").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("* e1")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e1").into())
+                .event_id(e1_id),
+        )
+        .await;
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* e2")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e2").into())
+                .event_id(e2_id)
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_E2",
+        ))
+        .await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e2");
+    assert_eq!(session_of(&item).as_deref(), Some("S_E2"));
+
+    timeline.handle_live_event(f.redaction(e2_id).sender(*ALICE)).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e1");
+    assert!(item.encryption_info().is_none());
+    assert_eq!(
+        item.get_shield(false),
+        TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+    );
+}
+
+/// Same as above, with the clear edit bundled in the original event.
+#[async_test]
+async fn test_redacted_encrypted_edit_falls_back_to_the_bundled_clear_edit() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let e1_id = event_id!("$e1");
+    let e2_id = event_id!("$e2");
+
+    timeline
+        .handle_live_event(
+            f.text_msg("original").sender(*ALICE).event_id(original_id).with_bundled_edit(
+                f.text_msg("* e1")
+                    .sender(*ALICE)
+                    .edit(original_id, MessageType::text_plain("e1").into())
+                    .event_id(e1_id),
+            ),
+        )
+        .await;
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "e1");
+
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* e2")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e2").into())
+                .event_id(e2_id)
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_E2",
+        ))
+        .await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e2");
+    assert_eq!(session_of(&item).as_deref(), Some("S_E2"));
+
+    timeline.handle_live_event(f.redaction(e2_id).sender(*ALICE)).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e1");
+    assert!(item.encryption_info().is_none());
+}
+
+/// The item keeps the encryption info of the edit it shows (the shield
+/// follows the text), and a clear edit of a clear original made after an
+/// encrypted one is still valid: it is judged against the original.
+#[async_test]
+async fn test_edit_is_judged_against_the_original_not_the_previous_edit() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+
+    timeline.handle_live_event(f.text_msg("original").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* e1")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e1").into())
+                .event_id(event_id!("$e1"))
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_E1",
+        ))
+        .await;
+    assert_eq!(session_of(&item_with_id(&timeline, original_id).await).as_deref(), Some("S_E1"));
+
+    timeline
+        .handle_live_event(
+            f.text_msg("* e2")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e2").into())
+                .event_id(event_id!("$e2")),
+        )
+        .await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e2");
+    assert!(item.encryption_info().is_none());
 }

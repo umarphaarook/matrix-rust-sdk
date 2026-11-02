@@ -96,6 +96,10 @@ pub struct EventTimelineItem {
     pub(super) edit_send_state: Option<EventSendState>,
     /// The message before our pending edits, put back if they're all dropped.
     pub(super) unedited_kind: Option<Box<MsgLikeKind>>,
+    /// What the item was before the first edit applied to it, put back if every
+    /// edit goes away (redacted, or all invalid). `None` while the item has not
+    /// been edited.
+    pub(super) before_edits: Option<Box<BeforeEdits>>,
     /// The kind of event timeline item, local or remote.
     pub(super) kind: EventTimelineItemKind,
     /// Whether or not the event belongs to an encrypted room.
@@ -144,6 +148,21 @@ pub struct EditRevision {
     pub timestamp: Option<MilliSecondsSinceUnixEpoch>,
 }
 
+/// What an item was before any edit was applied to it.
+///
+/// An edit replaces the displayed text and, so that the shield follows it, the
+/// displayed encryption info. Both have to be kept to put the original back,
+/// and the encryption info is what the validity of a later edit is checked
+/// against: the original event's, not the one of the edit on screen.
+#[derive(Clone, Debug)]
+pub(super) struct BeforeEdits {
+    /// The kind of the original message.
+    pub(super) kind: MsgLikeKind,
+
+    /// The encryption info of the original event.
+    pub(super) encryption_info: Option<Arc<EncryptionInfo>>,
+}
+
 /// A container for temporarily holding onto data that is going to be erased by
 /// a redaction once the server plays it back.
 #[derive(Clone, Debug)]
@@ -156,6 +175,9 @@ pub(super) struct UnredactedEventTimelineItem {
 
     /// JSON of the latest edit to this item.
     pub(crate) latest_edit_json: Option<Raw<AnySyncTimelineEvent>>,
+
+    /// What the item was before its edits.
+    before_edits: Option<Box<BeforeEdits>>,
 }
 
 impl EventTimelineItem {
@@ -181,6 +203,7 @@ impl EventTimelineItem {
             redaction_send_state: None,
             edit_send_state: None,
             unedited_kind: None,
+            before_edits: None,
             kind,
             is_room_encrypted,
         }
@@ -568,12 +591,51 @@ impl EventTimelineItem {
         new
     }
 
+    /// The encryption info of the original event.
+    ///
+    /// [`Self::encryption_info`] follows the edit on screen, since an edit is
+    /// shown with its own encryption info. An edit is valid or not depending on
+    /// how the original reached us, so it must be judged against this one.
+    pub(super) fn original_encryption_info(&self) -> Option<&EncryptionInfo> {
+        match &self.before_edits {
+            Some(before) => before.encryption_info.as_deref(),
+            None => self.encryption_info(),
+        }
+    }
+
+    /// What to remember of the item before an edit is applied to it: what was
+    /// remembered already, or else the item as it is now.
+    pub(super) fn before_edits_for_next_edit(&self) -> Option<Box<BeforeEdits>> {
+        if self.before_edits.is_some() {
+            return self.before_edits.clone();
+        }
+        let TimelineItemContent::MsgLike(content) = &self.content else { return None };
+        let encryption_info = match &self.kind {
+            EventTimelineItemKind::Local(_) => None,
+            EventTimelineItemKind::Remote(remote) => remote.encryption_info.clone(),
+        };
+        Some(Box::new(BeforeEdits { kind: content.kind.clone(), encryption_info }))
+    }
+
+    /// Forget the edits: put back the encryption info of the original, drop the
+    /// JSON of the latest edit, and give the kind of the original message to
+    /// the caller, who knows how to put it back in the content.
+    pub(super) fn take_before_edits(&mut self) -> Option<MsgLikeKind> {
+        let before = self.before_edits.take()?;
+        if let EventTimelineItemKind::Remote(remote) = &mut self.kind {
+            remote.encryption_info = before.encryption_info;
+            remote.latest_edit_json = None;
+        }
+        Some(before.kind)
+    }
+
     /// Create a clone of the current item, with content that's been redacted.
     pub(super) fn redact(&self, rules: &RedactionRules, is_local: bool) -> Self {
         let unredacted_item = is_local.then(|| UnredactedEventTimelineItem {
             content: self.content.clone(),
             original_json: self.original_json().cloned(),
             latest_edit_json: self.latest_edit_json().cloned(),
+            before_edits: self.before_edits.clone(),
         });
         let content = self.content.redact(rules);
         let kind = match &self.kind {
@@ -591,6 +653,7 @@ impl EventTimelineItem {
             redaction_send_state: None,
             edit_send_state: None,
             unedited_kind: None,
+            before_edits: None,
             kind,
             is_room_encrypted: self.is_room_encrypted,
         }
@@ -622,6 +685,7 @@ impl EventTimelineItem {
             redaction_send_state: None,
             edit_send_state: None,
             unedited_kind: None,
+            before_edits: unredacted_item.before_edits.clone(),
             kind,
             is_room_encrypted: self.is_room_encrypted,
         }

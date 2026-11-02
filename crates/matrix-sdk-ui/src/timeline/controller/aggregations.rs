@@ -749,11 +749,23 @@ impl Aggregations {
                         .is_some_and(|aggregations| resolve_edits(aggregations, items, &mut cowed));
                     // Otherwise nothing is pending anymore: put back what our edits replaced.
                     if !resolved {
-                        if cowed.unedited_kind.is_none() && cowed.edit_send_state.is_none() {
+                        // No edit left to show: the original is what remains, unless an edit
+                        // is still valid and only can't be applied (an ended poll).
+                        let edits_left = self
+                            .related_events
+                            .get(found)
+                            .is_some_and(|aggregations| has_usable_edit(aggregations, &cowed));
+                        if cowed.unedited_kind.is_none()
+                            && cowed.edit_send_state.is_none()
+                            && (edits_left || cowed.before_edits.is_none())
+                        {
                             return Ok(true);
                         }
                         let item = cowed.to_mut();
-                        if let Some(kind) = item.unedited_kind.take().map(|kind| *kind)
+                        let original_kind =
+                            if edits_left { None } else { item.take_before_edits() };
+                        if let Some(kind) =
+                            original_kind.or_else(|| item.unedited_kind.take().map(|kind| *kind))
                             && let TimelineItemContent::MsgLike(content) = &item.content
                         {
                             // A poll's votes live in the state an edit carries over, so
@@ -766,6 +778,7 @@ impl Aggregations {
                             };
                             item.content = TimelineItemContent::MsgLike(content.with_kind(kind));
                         }
+                        item.unedited_kind = None;
                         item.edit_send_state = None;
                     }
                     items.replace(
@@ -1072,6 +1085,21 @@ fn resolve_edits(
     }
 }
 
+/// Whether one of the edits could be shown for the given item: one of our own,
+/// or a remote one that is a valid replacement.
+fn has_usable_edit(aggregations: &[Aggregation], item: &EventTimelineItem) -> bool {
+    aggregations.iter().any(|a| match &a.kind {
+        AggregationKind::Edit(pending_edit) => {
+            a.send_state.is_some()
+                || match &a.own_id {
+                    TimelineEventItemId::TransactionId(_) => true,
+                    TimelineEventItemId::EventId(_) => is_valid_remote_edit(item, pending_edit),
+                }
+        }
+        _ => false,
+    })
+}
+
 /// Check that a remotely received edit is a valid replacement of the given
 /// item (same sender, same room, encryption consistent with the original…).
 ///
@@ -1089,9 +1117,11 @@ fn is_valid_remote_edit(item: &EventTimelineItem, edit: &PendingEdit) -> bool {
         return false;
     };
 
+    // Judge the edit against how the original reached us, not against the edit on
+    // screen: showing an edit overwrites the encryption info of the item.
     match check_validity_of_replacement_events(
         original_json,
-        item.encryption_info(),
+        item.original_encryption_info(),
         edit_json,
         edit.encryption_info.as_deref(),
     ) {
@@ -1130,6 +1160,7 @@ fn edit_item(
     };
 
     let PendingEdit { kind: edit_kind, edit_json, encryption_info, bundled_item_owner: _ } = edit;
+    let before_edits = item.before_edits_for_next_edit();
 
     match (edit_kind, content) {
         (
@@ -1147,6 +1178,7 @@ fn edit_item(
             if is_local_echo && item.edit_send_state.is_none() {
                 new_item.unedited_kind = Some(Box::new(MsgLikeKind::Message(msg.clone())));
             }
+            new_item.before_edits = before_edits;
             *item = Cow::Owned(new_item);
         }
 
@@ -1165,6 +1197,7 @@ fn edit_item(
                 if is_local_echo && item.edit_send_state.is_none() {
                     new_item.unedited_kind = Some(Box::new(MsgLikeKind::Poll(poll_state.clone())));
                 }
+                new_item.before_edits = before_edits;
                 *item = Cow::Owned(new_item);
             } else {
                 // The poll has ended, so we can't edit it anymore.
@@ -1183,8 +1216,11 @@ fn edit_item(
         }
     }
 
-    if let Some(encryption_info) = encryption_info {
-        *item = Cow::Owned(item.with_encryption_info(Some(encryption_info)));
+    // The item shows the edit, so it carries the encryption info of the edit (the
+    // shield follows the text on screen), clear or not. A local echo has none yet:
+    // it leaves the info of the item alone.
+    if !is_local_echo || encryption_info.is_some() {
+        *item = Cow::Owned(item.with_encryption_info(encryption_info));
     }
 
     true

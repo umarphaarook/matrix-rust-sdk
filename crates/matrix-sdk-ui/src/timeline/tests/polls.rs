@@ -40,6 +40,36 @@ async fn test_edited_poll_is_displayed() {
     assert!(edited_poll_state.has_been_edited);
 }
 
+/// Redacting the only edit of a poll puts the original question back, and
+/// keeps the votes received meanwhile.
+#[async_test]
+async fn test_redacted_poll_edit_restores_the_original_poll() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let poll_id = event_id!("$poll");
+    let edit_id = event_id!("$edit");
+
+    timeline.handle_live_event(poll_a2(f).sender(&ALICE).event_id(poll_id)).await;
+    timeline
+        .handle_live_event(
+            f.poll_edit(poll_id, "Left or right?", vec!["Left", "Right"])
+                .sender(&ALICE)
+                .event_id(edit_id),
+        )
+        .await;
+    timeline.send_poll_response(&BOB, vec!["0"], poll_id).await;
+    let poll_state = timeline.poll_state().await;
+    assert_eq!(poll_state.poll_start.question.text, "Left or right?");
+    assert!(poll_state.has_been_edited);
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(&ALICE)).await;
+
+    let poll_state = timeline.poll_state().await;
+    assert_eq!(poll_state.poll_start.question.text, "Up or down?");
+    assert!(!poll_state.has_been_edited);
+    assert_eq!(poll_state.response_data.len(), 1);
+}
+
 #[async_test]
 async fn test_voting_adds_the_vote_to_the_results() {
     let timeline = TestTimeline::new().await;
