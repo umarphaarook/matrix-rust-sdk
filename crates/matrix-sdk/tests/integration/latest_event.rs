@@ -95,7 +95,10 @@ async fn wait_for_latest_event(
         }
     };
     if tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.is_err() {
-        panic!("the latest event never was {expected}, it is {:?}", stream.next_now().await.event_id());
+        panic!(
+            "the latest event never was {expected}, it is {:?}",
+            stream.next_now().await.event_id()
+        );
     }
 }
 

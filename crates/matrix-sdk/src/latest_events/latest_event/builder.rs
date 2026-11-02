@@ -1722,7 +1722,8 @@ mod builder_tests {
         event_id,
         events::{
             AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-            SyncMessageLikeEvent, reaction::ReactionEventContent, relation::Annotation,
+            SyncMessageLikeEvent, poll::unstable_start::SyncUnstablePollStartEvent,
+            reaction::ReactionEventContent, relation::Annotation,
             room::message::RoomMessageEventContent,
         },
         owned_event_id, owned_room_id, room_id,
@@ -3147,6 +3148,56 @@ mod builder_tests {
         }
 
         assert_eq!(buffer.buffer.len(), 1);
+    }
+
+    /// The local echo of an edit of a poll (the user edits their own poll) is
+    /// no latest event value, like the local echo of an edit of a message.
+    #[async_test]
+    async fn test_local_new_local_event_with_a_poll_edit_is_ignored() {
+        let (client, _room_id, room_send_queue, room_event_cache) = local_prelude().await;
+        let user_id = client.user_id().unwrap();
+
+        let mut buffer = BufferOfValuesForLocalEvents::new();
+
+        let transaction_id = OwnedTransactionId::from("txnid0");
+        let poll_edit = EventFactory::new()
+            .poll_edit(event_id!("$poll"), "new?", vec!["yes", "no"])
+            .sender(user_id)
+            .into_any_sync_message_like_event();
+        let AnySyncMessageLikeEvent::UnstablePollStart(SyncUnstablePollStartEvent::Original(
+            poll_edit,
+        )) = poll_edit
+        else {
+            panic!("the event is not a poll start");
+        };
+
+        let content = LocalEchoContent::Event {
+            serialized_event: SerializableEventContent::new(
+                &AnyMessageLikeEventContent::UnstablePollStart(poll_edit.content),
+            )
+            .unwrap(),
+            send_handle: SendHandle::new(
+                room_send_queue.clone(),
+                transaction_id.clone(),
+                MilliSecondsSinceUnixEpoch::now(),
+            ),
+            send_error: None,
+        };
+        let update = RoomSendQueueUpdate::NewLocalEvent(LocalEcho { transaction_id, content });
+
+        assert_matches!(
+            Builder::new_local(
+                &update,
+                &mut buffer,
+                &room_event_cache,
+                LatestEventValue::None,
+                user_id,
+                None
+            )
+            .await,
+            None
+        );
+        assert!(buffer.buffer.is_empty());
     }
 
     #[async_test]
