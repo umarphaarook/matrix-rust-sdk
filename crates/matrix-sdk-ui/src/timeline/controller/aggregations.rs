@@ -1010,6 +1010,12 @@ fn resolve_edits(
                 }
 
                 TimelineEventItemId::EventId(event_id) => {
+                    // An invalid (e.g. forged) remote edit must not hide an earlier valid
+                    // one: only valid edits compete for being the best.
+                    if !is_valid_remote_edit(event, pending_edit) {
+                        continue;
+                    }
+
                     if let Some(best_edit_pos) = &mut best_edit_pos {
                         // Find the position of the timeline owning the edit: either the bundled
                         // item owner if this was a bundled edit, or the edit event itself.
@@ -1066,6 +1072,37 @@ fn resolve_edits(
     }
 }
 
+/// Check that a remotely received edit is a valid replacement of the given
+/// item (same sender, same room, encryption consistent with the original…).
+///
+/// Must not be used for local echoes, which have no raw JSON.
+fn is_valid_remote_edit(item: &EventTimelineItem, edit: &PendingEdit) -> bool {
+    let Some(original_json) = item.original_json() else {
+        error!("The original event does not have the JSON field set.");
+        return false;
+    };
+
+    let Some(edit_json) = &edit.edit_json else {
+        error!(
+            "The replacement event of a remotely received edit does not have the JSON field set."
+        );
+        return false;
+    };
+
+    match check_validity_of_replacement_events(
+        original_json,
+        item.encryption_info(),
+        edit_json,
+        edit.encryption_info.as_deref(),
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
+            false
+        }
+    }
+}
+
 /// Apply the selected edit to the given EventTimelineItem.
 ///
 /// Returns true if the edit was applied, false otherwise (because the edit and
@@ -1084,29 +1121,8 @@ fn edit_item(
     // We don't have yet a full JSON of the event, so we can't do the validation
     // here.
     if !is_local_echo {
-        let Some(original_json) = item.original_json() else {
-            error!("The original event does not have the JSON field set.");
+        if !is_valid_remote_edit(item, &edit) {
             return false;
-        };
-
-        let Some(edit_json) = &edit.edit_json else {
-            error!(
-                "The replacement event of a remotely received edit does not have the JSON field set."
-            );
-            return false;
-        };
-
-        match check_validity_of_replacement_events(
-            original_json,
-            item.encryption_info(),
-            edit_json,
-            edit.encryption_info.as_deref(),
-        ) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
-                return false;
-            }
         }
     }
 

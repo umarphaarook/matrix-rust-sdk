@@ -33,7 +33,7 @@ use matrix_sdk_ui::{
     },
 };
 use ruma::{
-    OwnedRoomId, event_id,
+    EventId, OwnedRoomId, event_id,
     events::{
         AnyMessageLikeEventContent, AnyTimelineEvent,
         poll::unstable_start::{
@@ -1423,4 +1423,159 @@ async fn test_failed_edit_send_state_is_exposed() {
     );
 
     assert_pending!(timeline_stream);
+}
+
+impl PendingEditHelper {
+    /// Wait until the item of `event_id` shows `expected` as its body and
+    /// return whether it is flagged as edited.
+    async fn body_and_edited(&self, event_id: &EventId, expected: &str) -> bool {
+        for _ in 0..100 {
+            let items = self.timeline.items().await;
+            if let Some(msg) = items
+                .iter()
+                .filter_map(|i| i.as_event())
+                .find(|e| e.event_id() == Some(event_id))
+                .and_then(|e| e.content().as_message())
+                && msg.body() == expected
+            {
+                return msg.is_edited();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the item {event_id} never showed the body {expected:?}");
+    }
+
+    /// Give the timeline time to (not) react, then check the body is still
+    /// `expected`.
+    async fn settle_then_check(&self, event_id: &EventId, expected: &str) {
+        sleep(Duration::from_millis(300)).await;
+        self.body_and_edited(event_id, expected).await;
+    }
+}
+
+// An edit sent by someone else than the author is not a valid replacement:
+// the forged edits below are Bob's edits of Alice's message.
+
+/// Live, the forged edit simply fails to apply on top of the valid one: this
+/// held before the fix and guards against regressing it.
+#[async_test]
+async fn test_forged_edit_does_not_hide_a_valid_edit_live() {
+    let mut h = PendingEditHelper::new().await;
+    let f = EventFactory::new();
+    let original = event_id!("$original");
+
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(f.text_msg("hi").sender(&ALICE).event_id(original)),
+    )
+    .await;
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id).add_timeline_event(
+            f.text_msg("* valid")
+                .sender(&ALICE)
+                .event_id(event_id!("$edit"))
+                .edit(original, RoomMessageEventContent::text_plain("valid").into()),
+        ),
+    )
+    .await;
+    assert!(h.body_and_edited(original, "valid").await);
+
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id).add_timeline_event(
+            f.text_msg("* forged")
+                .sender(&BOB)
+                .event_id(event_id!("$forged"))
+                .edit(original, RoomMessageEventContent::text_plain("forged").into()),
+        ),
+    )
+    .await;
+
+    h.settle_then_check(original, "valid").await;
+}
+
+#[async_test]
+async fn test_forged_edit_does_not_hide_a_valid_edit_when_original_arrives_last() {
+    let mut h = PendingEditHelper::new().await;
+    let f = EventFactory::new();
+    let original = event_id!("$original");
+
+    // Both edits are known before the original, as on a cold start.
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(
+                f.text_msg("* valid")
+                    .sender(&ALICE)
+                    .event_id(event_id!("$edit"))
+                    .edit(original, RoomMessageEventContent::text_plain("valid").into()),
+            )
+            .add_timeline_event(
+                f.text_msg("* forged")
+                    .sender(&BOB)
+                    .event_id(event_id!("$forged"))
+                    .edit(original, RoomMessageEventContent::text_plain("forged").into()),
+            ),
+    )
+    .await;
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(f.text_msg("hi").sender(&ALICE).event_id(original)),
+    )
+    .await;
+
+    assert!(h.body_and_edited(original, "valid").await);
+}
+
+#[async_test]
+async fn test_forged_edit_does_not_hide_a_valid_edit_from_backpagination() {
+    let mut h = PendingEditHelper::new().await;
+    let f = EventFactory::new();
+    let original = event_id!("$original");
+
+    h.handle_backpagination(
+        vec![
+            f.text_msg("* forged")
+                .sender(&BOB)
+                .event_id(event_id!("$forged"))
+                .room(&h.room_id)
+                .edit(original, RoomMessageEventContent::text_plain("forged").into())
+                .into(),
+            f.text_msg("* valid")
+                .sender(&ALICE)
+                .event_id(event_id!("$edit"))
+                .room(&h.room_id)
+                .edit(original, RoomMessageEventContent::text_plain("valid").into())
+                .into(),
+        ],
+        10,
+    )
+    .await;
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(f.text_msg("hi").sender(&ALICE).event_id(original)),
+    )
+    .await;
+
+    assert!(h.body_and_edited(original, "valid").await);
+}
+
+#[async_test]
+async fn test_only_a_forged_edit_shows_the_original() {
+    let mut h = PendingEditHelper::new().await;
+    let f = EventFactory::new();
+    let original = event_id!("$original");
+
+    h.handle_sync(
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(f.text_msg("hi").sender(&ALICE).event_id(original))
+            .add_timeline_event(
+                f.text_msg("* forged")
+                    .sender(&BOB)
+                    .event_id(event_id!("$forged"))
+                    .edit(original, RoomMessageEventContent::text_plain("forged").into()),
+            ),
+    )
+    .await;
+
+    h.settle_then_check(original, "hi").await;
+    assert!(!h.body_and_edited(original, "hi").await);
 }
