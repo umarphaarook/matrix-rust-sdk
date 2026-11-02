@@ -1522,7 +1522,7 @@ async fn mount_sliding_sync_delivering_the_session_key(
                 });
                 // A deadlock must fail the test instead of hanging it.
                 done_receiver
-                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .recv_timeout(Duration::from_secs(30))
                     .expect("the session key import should finish");
             } else if let Some((room_id, event)) = &notified_room {
                 rooms = json!({ room_id.to_string(): { "timeline": [event] } });

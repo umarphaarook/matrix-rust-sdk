@@ -1120,10 +1120,8 @@ fn edit_item(
     //
     // We don't have yet a full JSON of the event, so we can't do the validation
     // here.
-    if !is_local_echo {
-        if !is_valid_remote_edit(item, &edit) {
-            return false;
-        }
+    if !is_local_echo && !is_valid_remote_edit(item, &edit) {
+        return false;
     }
 
     let TimelineItemContent::MsgLike(content) = item.content() else {
