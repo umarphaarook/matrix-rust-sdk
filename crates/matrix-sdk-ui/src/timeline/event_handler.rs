@@ -1384,6 +1384,11 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
     /// After the removal of an aggregation (a redacted or discarded edit), the
     /// events that quote the edited item must not keep the text of the edit.
+    ///
+    /// Known limit, shared with the handling of a new edit: the edited item is
+    /// needed to know what the quotes must show, so when it is not in the
+    /// timeline (it is out of the window) nothing is updated, even if a reply
+    /// to it is in the window.
     pub(in crate::timeline) fn update_responses_after_removal(
         meta: &mut TimelineMetadata,
         items: &mut ObservableItemsTransaction<'_>,

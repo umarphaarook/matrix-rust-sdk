@@ -698,7 +698,9 @@ mod tests {
         RwLock, SendQueueUpdate, WeakClient, WeakRoom, With, broadcast, listen_to_updates, mpsc,
     };
     use crate::{
-        latest_events::{LatestEventQueueUpdate, local_room_message},
+        latest_events::{
+            ComputeReason, LatestEventQueueUpdate, compute_latest_events, local_room_message,
+        },
         test_utils::mocks::MatrixMockServer,
     };
 
@@ -874,7 +876,8 @@ mod tests {
         let (_send_queue_generic_update_sender, mut send_queue_generic_update_receiver) =
             broadcast::channel(1);
         let (_room_info_update_sender, mut room_info_update_receiver) = broadcast::channel(1);
-        let (latest_event_queue_sender, latest_event_queue_receiver) = mpsc::unbounded_channel();
+        let (latest_event_queue_sender, mut latest_event_queue_receiver) =
+            mpsc::unbounded_channel();
 
         // New event cache update, but the `LatestEvents` isn't listening to it.
         {
@@ -921,8 +924,15 @@ mod tests {
                 .is_continue()
             );
 
-            // A latest event computation has been triggered!
-            assert!(latest_event_queue_receiver.is_empty().not());
+            // A latest event computation has been triggered, for an update of the event
+            // cache: an empty event cache then means an emptied room.
+            assert_matches!(
+                latest_event_queue_receiver.try_recv(),
+                Ok(LatestEventQueueUpdate::EventCache {
+                    reason: ComputeReason::EventCacheUpdate,
+                    ..
+                })
+            );
         }
     }
 
@@ -1607,6 +1617,59 @@ mod tests {
             Some(event_id!("$edit"))
         );
         assert_eq!(room.latest_event().event_id().as_deref(), Some(event_id!("$edit")));
+    }
+
+    /// The same restored edit and the same empty event cache: the computation
+    /// that follows the restore keeps the value, the one that follows an update
+    /// of the event cache takes the room for emptied and erases it.
+    #[async_test]
+    async fn test_empty_event_cache_erases_the_value_only_for_an_update() {
+        let room_id = owned_room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(&room_id);
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = client.base_client().get_or_create_room(&room_id, RoomState::Joined);
+        let edit: TimelineEvent = event_factory
+            .text_msg("* edited")
+            .event_id(event_id!("$edit"))
+            .edit(
+                event_id!("$original"),
+                ruma::events::room::message::RoomMessageEventContent::text_plain("edited").into(),
+            )
+            .into();
+        let mut room_info = room.clone_info();
+        room_info.set_latest_event(LatestEventValue::Remote(edit));
+        room.update_room_info(|_| (room_info, Default::default())).await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let (latest_event_queue_sender, _latest_event_queue_receiver) = mpsc::unbounded_channel();
+        let registered_rooms = RegisteredRooms::new(
+            WeakClient::from_client(&client),
+            event_cache,
+            &latest_event_queue_sender,
+        );
+        let room_latest_events = registered_rooms.for_room(&room_id).await.unwrap().unwrap();
+
+        for (reason, kept) in
+            [(ComputeReason::Restored, true), (ComputeReason::EventCacheUpdate, false)]
+        {
+            compute_latest_events(
+                &registered_rooms,
+                &[LatestEventQueueUpdate::EventCache { room_id: room_id.clone(), reason }],
+            )
+            .await;
+
+            let value = room_latest_events.read().await.for_room().get().await;
+            assert_eq!(
+                value.event_id().as_deref(),
+                kept.then(|| event_id!("$edit")),
+                "after {reason:?}"
+            );
+        }
     }
 
     #[async_test]

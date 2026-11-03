@@ -361,6 +361,14 @@ pub(super) enum ComputeReason {
     /// The event cache may hold nothing yet (nothing stored, or the last
     /// chunk is a gap): this says nothing of the room, so the restored value
     /// must stay until the event cache has something to tell.
+    ///
+    /// Known limit: when another process has written to the store, the
+    /// reload of a dirty cross-process lock sends an update of the event cache
+    /// for every room, whatever the store holds
+    /// (`ReloadableStateLockWriteGuard::reload`). If the store is empty,
+    /// that update is taken for an emptied room and erases a restored
+    /// value. Only the computation that follows the restore is protected
+    /// here.
     Restored,
 }
 

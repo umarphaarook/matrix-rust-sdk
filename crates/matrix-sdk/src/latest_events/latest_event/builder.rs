@@ -175,7 +175,11 @@ impl Builder {
             .await;
 
         // An event cache that is empty because nothing was loaded yet says nothing of
-        // the room: only an update of the event cache tells that it has been emptied.
+        // the room, so the computation that follows the restore of a value does not
+        // take it for an emptied room. An update of the event cache does, even
+        // when the update only comes from the reload of a dirty cross-process
+        // lock onto an empty store (a known limit, see
+        // `ComputeReason::Restored`).
         let room_has_been_emptied =
             room_has_been_emptied && reason == ComputeReason::EventCacheUpdate;
 
