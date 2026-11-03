@@ -62,7 +62,7 @@ use crate::{
     timeline::{
         TimelineUniqueId,
         algorithms::rfind_event_item,
-        controller::aggregations::{AggregationSendHandle, PendingEdit},
+        controller::aggregations::{AggregationSendHandle, PendingEdit, RemovedAggregation},
         event_item::OtherMessageLike,
     },
     unable_to_decrypt_hook::UtdHookManager,
@@ -938,7 +938,22 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         let aggregation_id = TimelineEventItemId::EventId(aggregation_id);
 
         match self.meta.aggregations.try_remove_aggregation(&aggregation_id, self.items) {
-            Ok(val) => val,
+            Ok(Some(RemovedAggregation { target, edited_item })) => {
+                // Redacting an edit changes what the item shows: the events that quote it
+                // must not keep the text of the edit.
+                if let Some(edited_item) = edited_item
+                    && let TimelineEventItemId::EventId(target) = target
+                {
+                    Self::maybe_update_responses(
+                        self.meta,
+                        self.items,
+                        &target,
+                        EmbeddedEvent::from_timeline_item(&edited_item),
+                    );
+                }
+                true
+            }
+            Ok(None) => false,
             // This wasn't a known aggregation that was redacted.
             Err(err) => {
                 warn!("error while attempting to remove aggregation: {err}");

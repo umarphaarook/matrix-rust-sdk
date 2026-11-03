@@ -98,6 +98,16 @@ pub(in crate::timeline) struct PendingEdit {
     pub bundled_item_owner: Option<OwnedEventId>,
 }
 
+/// What [`Aggregations::try_remove_aggregation`] did.
+pub(in crate::timeline) struct RemovedAggregation {
+    /// The item the removed aggregation applied to.
+    pub target: TimelineEventItemId,
+
+    /// The item after the removal of an edit, if it was one and the item is in
+    /// the timeline: what the events that quote the item must show now.
+    pub edited_item: Option<EventTimelineItem>,
+}
+
 /// Which kind of aggregation (related event) is this?
 #[derive(Clone, Debug)]
 pub(crate) enum AggregationKind {
@@ -688,7 +698,7 @@ impl Aggregations {
     /// If so, unapplies it by replacing the corresponding related item, if
     /// needs be.
     ///
-    /// Returns true if an aggregation was found. This doesn't mean
+    /// Returns `Some` if an aggregation was found. This doesn't mean
     /// the underlying item has been updated, if it was missing from the
     /// timeline for instance.
     ///
@@ -698,8 +708,11 @@ impl Aggregations {
         &mut self,
         aggregation_id: &TimelineEventItemId,
         items: &mut ObservableItemsTransaction<'_>,
-    ) -> Result<bool, AggregationError> {
-        let Some(found) = self.inverted_map.get(aggregation_id) else { return Ok(false) };
+    ) -> Result<Option<RemovedAggregation>, AggregationError> {
+        let Some(found) = self.inverted_map.get(aggregation_id).cloned() else {
+            return Ok(None);
+        };
+        let found = &found;
 
         // Find and remove the aggregation in the other mapping.
         let aggregation = if let Some(aggregations) = self.related_events.get_mut(found) {
@@ -724,8 +737,10 @@ impl Aggregations {
                 "incorrect internal state: {aggregation_id:?} was present in the inverted map, \
                  not in related-to map."
             );
-            return Ok(false);
+            return Ok(None);
         };
+
+        let mut edited_item = None;
 
         if let Some((item_pos, item)) = rfind_event_by_item_id(items, found) {
             let mut cowed = Cow::Borrowed(&*item);
@@ -749,21 +764,34 @@ impl Aggregations {
                         .is_some_and(|aggregations| resolve_edits(aggregations, items, &mut cowed));
                     // Otherwise nothing is pending anymore: put back what our edits replaced.
                     if !resolved {
-                        // No edit left to show: the original is what remains, unless an edit
-                        // is still valid and only can't be applied (an ended poll).
+                        // An edit may be valid and still not apply (the poll has ended, and
+                        // ended polls can't be edited): the item then keeps the edit it shows.
+                        // If the edit removed isn't the one on screen, nothing changes. If it
+                        // is, there's nothing to fall back to but the original: the removed
+                        // text must go (a reload would show the previous valid edit instead).
                         let edits_left = self
                             .related_events
                             .get(found)
                             .is_some_and(|aggregations| has_usable_edit(aggregations, &cowed));
+                        let removed_edit_is_shown = match aggregation_id {
+                            TimelineEventItemId::EventId(id) => {
+                                shown_edit_event_id(&cowed).is_none_or(|shown| shown == *id)
+                            }
+                            TimelineEventItemId::TransactionId(_) => true,
+                        };
+                        let restore_original = !edits_left || removed_edit_is_shown;
                         if cowed.unedited_kind.is_none()
                             && cowed.edit_send_state.is_none()
-                            && (edits_left || cowed.before_edits.is_none())
+                            && (!restore_original || cowed.before_edits.is_none())
                         {
-                            return Ok(true);
+                            return Ok(Some(RemovedAggregation {
+                                target: found.clone(),
+                                edited_item,
+                            }));
                         }
                         let item = cowed.to_mut();
                         let original_kind =
-                            if edits_left { None } else { item.take_before_edits() };
+                            if restore_original { item.take_before_edits() } else { None };
                         if let Some(kind) =
                             original_kind.or_else(|| item.unedited_kind.take().map(|kind| *kind))
                             && let TimelineItemContent::MsgLike(content) = &item.content
@@ -781,6 +809,7 @@ impl Aggregations {
                         item.unedited_kind = None;
                         item.edit_send_state = None;
                     }
+                    edited_item = Some(cowed.clone().into_owned());
                     items.replace(
                         item_pos,
                         TimelineItem::new(cowed.into_owned(), item.internal_id.to_owned()),
@@ -791,7 +820,7 @@ impl Aggregations {
             info!("missing related-to item ({found:?}) for aggregation {aggregation_id:?}");
         }
 
-        Ok(true)
+        Ok(Some(RemovedAggregation { target: found.clone(), edited_item }))
     }
 
     /// Apply all the aggregations to a [`TimelineItemContent`].
@@ -1083,6 +1112,11 @@ fn resolve_edits(
     } else {
         false
     }
+}
+
+/// The ID of the edit event the item currently shows, if it shows one.
+fn shown_edit_event_id(item: &EventTimelineItem) -> Option<OwnedEventId> {
+    item.latest_edit_json()?.get_field::<OwnedEventId>("event_id").ok().flatten()
 }
 
 /// Whether one of the edits could be shown for the given item: one of our own,

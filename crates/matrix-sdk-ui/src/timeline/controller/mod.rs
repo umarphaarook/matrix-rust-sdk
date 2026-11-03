@@ -1035,7 +1035,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
             &TimelineEventItemId::TransactionId(txn_id.to_owned()),
             &mut txn.items,
         ) {
-            Ok(val) => val,
+            Ok(removed) => removed.is_some(),
             Err(err) => {
                 warn!("error when discarding local echo for an aggregation: {err}");
                 // The aggregation has been found, it's just that we couldn't discard it.

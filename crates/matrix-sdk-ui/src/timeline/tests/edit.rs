@@ -893,3 +893,45 @@ async fn test_edit_is_judged_against_the_original_not_the_previous_edit() {
     assert_eq!(body_of(&item), "e2");
     assert!(item.encryption_info().is_none());
 }
+
+/// A reply quotes the text of the message it replies to. Redacting an edit
+/// changes that text, and the quote must follow.
+#[async_test]
+async fn test_redacted_edit_updates_the_quote_in_a_reply() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let reply_id = event_id!("$reply");
+    let edit_id = event_id!("$edit");
+
+    timeline.handle_live_event(f.text_msg("o").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("reply").sender(*BOB).reply_to(original_id).event_id(reply_id),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            f.text_msg("* secret")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("secret").into())
+                .event_id(edit_id),
+        )
+        .await;
+    assert_eq!(quoted_body(&timeline, reply_id).await, "secret");
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(*ALICE)).await;
+
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "o");
+    assert_eq!(quoted_body(&timeline, reply_id).await, "o");
+}
+
+/// The body of the event a reply quotes.
+async fn quoted_body(timeline: &TestTimeline, reply_id: &EventId) -> String {
+    let item = item_with_id(timeline, reply_id).await;
+    let details = item.content().in_reply_to().expect("a reply").clone();
+    let crate::timeline::TimelineDetails::Ready(quoted) = details.event else {
+        panic!("the quoted event isn't ready");
+    };
+    quoted.content.as_message().expect("a quoted message").body().to_owned()
+}

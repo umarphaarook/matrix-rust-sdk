@@ -70,6 +70,72 @@ async fn test_redacted_poll_edit_restores_the_original_poll() {
     assert_eq!(poll_state.response_data.len(), 1);
 }
 
+/// A poll with two edits ends. Redacting the edit on screen shows the original
+/// question, not the text of the redacted edit: an ended poll takes no more
+/// edits, so the previous edit can't be shown again live. (A reload shows it,
+/// since the edits are then applied before the end.)
+#[async_test]
+async fn test_redacted_newest_edit_of_an_ended_poll_leaves_the_original() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let poll_id = event_id!("$poll");
+
+    timeline.handle_live_event(poll_a2(f).sender(&ALICE).event_id(poll_id)).await;
+    timeline
+        .handle_live_event(
+            f.poll_edit(poll_id, "e1?", vec!["Left", "Right"])
+                .sender(&ALICE)
+                .event_id(event_id!("$e1")),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            f.poll_edit(poll_id, "e2?", vec!["Left", "Right"])
+                .sender(&ALICE)
+                .event_id(event_id!("$e2")),
+        )
+        .await;
+    timeline.send_poll_end(&ALICE, "ended", poll_id).await;
+    assert_eq!(timeline.poll_state().await.poll_start.question.text, "e2?");
+
+    timeline.handle_live_event(f.redaction(event_id!("$e2")).sender(&ALICE)).await;
+
+    let poll_state = timeline.poll_state().await;
+    assert_eq!(poll_state.poll_start.question.text, "Up or down?");
+    assert!(poll_state.end_event_timestamp.is_some());
+}
+
+/// Same poll, but the older edit is redacted: the edit on screen stays.
+#[async_test]
+async fn test_redacted_older_edit_of_an_ended_poll_leaves_the_newest_edit() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let poll_id = event_id!("$poll");
+
+    timeline.handle_live_event(poll_a2(f).sender(&ALICE).event_id(poll_id)).await;
+    timeline
+        .handle_live_event(
+            f.poll_edit(poll_id, "e1?", vec!["Left", "Right"])
+                .sender(&ALICE)
+                .event_id(event_id!("$e1")),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            f.poll_edit(poll_id, "e2?", vec!["Left", "Right"])
+                .sender(&ALICE)
+                .event_id(event_id!("$e2")),
+        )
+        .await;
+    timeline.send_poll_end(&ALICE, "ended", poll_id).await;
+
+    timeline.handle_live_event(f.redaction(event_id!("$e1")).sender(&ALICE)).await;
+
+    let poll_state = timeline.poll_state().await;
+    assert_eq!(poll_state.poll_start.question.text, "e2?");
+    assert!(poll_state.has_been_edited);
+}
+
 #[async_test]
 async fn test_voting_adds_the_vote_to_the_results() {
     let timeline = TestTimeline::new().await;
