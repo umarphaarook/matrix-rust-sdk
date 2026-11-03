@@ -938,19 +938,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         let aggregation_id = TimelineEventItemId::EventId(aggregation_id);
 
         match self.meta.aggregations.try_remove_aggregation(&aggregation_id, self.items) {
-            Ok(Some(RemovedAggregation { target, edited_item })) => {
-                // Redacting an edit changes what the item shows: the events that quote it
-                // must not keep the text of the edit.
-                if let Some(edited_item) = edited_item
-                    && let TimelineEventItemId::EventId(target) = target
-                {
-                    Self::maybe_update_responses(
-                        self.meta,
-                        self.items,
-                        &target,
-                        EmbeddedEvent::from_timeline_item(&edited_item),
-                    );
-                }
+            Ok(Some(removed)) => {
+                Self::update_responses_after_removal(self.meta, self.items, &removed);
                 true
             }
             Ok(None) => false,
@@ -1393,6 +1382,25 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         }
     }
 
+    /// After the removal of an aggregation (a redacted or discarded edit), the
+    /// events that quote the edited item must not keep the text of the edit.
+    pub(in crate::timeline) fn update_responses_after_removal(
+        meta: &mut TimelineMetadata,
+        items: &mut ObservableItemsTransaction<'_>,
+        removed: &RemovedAggregation,
+    ) {
+        if let Some(edited_item) = &removed.edited_item
+            && let TimelineEventItemId::EventId(target) = &removed.target
+        {
+            Self::maybe_update_responses(
+                meta,
+                items,
+                target,
+                EmbeddedEvent::from_timeline_item(edited_item),
+            );
+        }
+    }
+
     /// After updating the timeline item `new_item` which id is
     /// `target_event_id`, update other items that are responses to this item.
     fn maybe_update_responses(
@@ -1422,7 +1430,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
             let Some(event_item) = item.as_event() else { continue };
             let Some(msglike) = event_item.content.as_msglike() else { continue };
-            let Some(message) = msglike.as_message() else { continue };
             let Some(in_reply_to) = msglike.in_reply_to.as_ref() else { continue };
 
             trace!(reply_event_id = ?event_item.identifier(), "Updating response to updated event");
@@ -1431,9 +1438,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 event: TimelineDetails::Ready(Box::new(new_embedded_event.clone())),
             };
 
-            let new_reply_content = TimelineItemContent::MsgLike(
-                msglike.with_in_reply_to(in_reply_to).with_kind(MsgLikeKind::Message(message)),
-            );
+            let new_reply_content =
+                TimelineItemContent::MsgLike(msglike.with_in_reply_to(in_reply_to));
             let new_reply_item = item.with_kind(event_item.with_content(new_reply_content));
             items.replace(timeline_item_index, new_reply_item);
         }

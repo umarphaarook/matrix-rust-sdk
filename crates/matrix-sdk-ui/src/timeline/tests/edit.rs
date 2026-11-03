@@ -926,6 +926,70 @@ async fn test_redacted_edit_updates_the_quote_in_a_reply() {
     assert_eq!(quoted_body(&timeline, reply_id).await, "o");
 }
 
+/// A pending local edit shows in the quote of a reply, and aborting it takes
+/// the draft out of the quote too.
+#[async_test]
+async fn test_discarded_local_edit_updates_the_quote_in_a_reply() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let reply_id = event_id!("$reply");
+
+    timeline.handle_live_event(f.text_msg("o").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("reply").sender(*BOB).reply_to(original_id).event_id(reply_id),
+        )
+        .await;
+
+    let txn_id = timeline.handle_local_event(local_edit(original_id, "draft")).await;
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "draft");
+    assert_eq!(quoted_body(&timeline, reply_id).await, "draft");
+
+    assert!(timeline.controller.discard_local_echo(&txn_id).await);
+
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "o");
+    assert_eq!(quoted_body(&timeline, reply_id).await, "o");
+}
+
+/// A reply that is not a message (a sticker here) quotes the edited text too,
+/// and follows the redaction of the edit.
+#[async_test]
+async fn test_redacted_edit_updates_the_quote_in_a_non_message_reply() {
+    let timeline = TestTimeline::new().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+    let edit_id = event_id!("$edit");
+    let reply_id = event_id!("$reply");
+
+    timeline.handle_live_event(f.text_msg("o").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("* secret")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("secret").into())
+                .event_id(edit_id),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            f.sticker(
+                "sticker",
+                ruma::events::room::ImageInfo::new(),
+                ruma::owned_mxc_uri!("mxc://server.name/sticker"),
+            )
+            .sender(*BOB)
+            .reply_thread(event_id!("$root"), original_id)
+            .event_id(reply_id),
+        )
+        .await;
+    assert_eq!(quoted_body(&timeline, reply_id).await, "secret");
+
+    timeline.handle_live_event(f.redaction(edit_id).sender(*ALICE)).await;
+
+    assert_eq!(quoted_body(&timeline, reply_id).await, "o");
+}
+
 /// The body of the event a reply quotes.
 async fn quoted_body(timeline: &TestTimeline, reply_id: &EventId) -> String {
     let item = item_with_id(timeline, reply_id).await;

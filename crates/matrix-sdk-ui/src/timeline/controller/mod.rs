@@ -1035,7 +1035,17 @@ impl<P: RoomDataProvider> TimelineController<P> {
             &TimelineEventItemId::TransactionId(txn_id.to_owned()),
             &mut txn.items,
         ) {
-            Ok(removed) => removed.is_some(),
+            Ok(Some(removed)) => {
+                // Discarding an edit changes what the item shows: the quotes of the item
+                // must follow.
+                super::event_handler::TimelineEventHandler::update_responses_after_removal(
+                    &mut txn.meta,
+                    &mut txn.items,
+                    &removed,
+                );
+                true
+            }
+            Ok(None) => false,
             Err(err) => {
                 warn!("error when discarding local echo for an aggregation: {err}");
                 // The aggregation has been found, it's just that we couldn't discard it.
