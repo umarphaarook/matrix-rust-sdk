@@ -62,6 +62,20 @@ impl Builder {
         let mut room_has_been_emptied = true;
         let mut current_value_must_be_erased = false;
 
+        // When the current value is an edit, redacting the event it edits takes the
+        // edit away with it, so such a redaction erases the current value too.
+        let event_edited_by_current_value = match &current_event {
+            LatestEventValue::Remote(event) => {
+                match filter_timeline_event(event, None, own_user_id, power_levels) {
+                    ControlFlow::Continue(FilterContinue { edited_event_id, .. }) => {
+                        edited_event_id
+                    }
+                    ControlFlow::Break(()) => None,
+                }
+            }
+            _ => None,
+        };
+
         // Track the edits of each event, newest first (the scan goes backwards).
         let mut edits_for_event: HashMap<OwnedEventId, Vec<TimelineEvent>> = HashMap::new();
 
@@ -81,7 +95,23 @@ impl Builder {
                         current_value_must_be_erased: erased,
                         edited_event_id,
                     }) => {
-                        current_value_must_be_erased = erased;
+                        // A redaction may come before older events that are not candidates
+                        // either: they must not take the erasure back.
+                        current_value_must_be_erased |= erased
+                            || event_edited_by_current_value.as_ref().is_some_and(|edited| {
+                                matches!(
+                                    filter_timeline_event(
+                                        event,
+                                        Some(edited),
+                                        own_user_id,
+                                        power_levels,
+                                    ),
+                                    ControlFlow::Continue(FilterContinue {
+                                        current_value_must_be_erased: true,
+                                        ..
+                                    })
+                                )
+                            });
 
                         if let Some(edited_event_id) = edited_event_id {
                             // This is an edit. Keep every one: an invalid (forged) newer
@@ -2880,6 +2910,277 @@ mod builder_tests {
                 Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
             ),
             Some(owned_event_id!("$edit"))
+        );
+    }
+
+    /// A timeline event that arrived encrypted from the given sender.
+    fn decrypted(
+        event: Raw<ruma::events::AnyTimelineEvent>,
+        sender: &ruma::UserId,
+    ) -> TimelineEvent {
+        use matrix_sdk_base::deserialized_responses::{
+            AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, VerificationState,
+        };
+
+        TimelineEvent::from_decrypted(
+            DecryptedRoomEvent {
+                event,
+                encryption_info: Arc::new(EncryptionInfo {
+                    sender: sender.to_owned(),
+                    sender_device: None,
+                    forwarder: None,
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: "fake_key".to_owned(),
+                        sender_claimed_keys: Default::default(),
+                        session_id: Some("fake_session".to_owned()),
+                    },
+                    verification_state: VerificationState::Verified,
+                }),
+                unsigned_encryption_info: None,
+            },
+            None,
+        )
+    }
+
+    /// The value the builder computes for the given room, as an event ID and
+    /// whether it arrived encrypted.
+    async fn remote_value(
+        room_event_cache: &RoomEventCache,
+        current: LatestEventValue,
+        user_id: &ruma::UserId,
+    ) -> Option<(OwnedEventId, bool)> {
+        match Builder::new_remote(room_event_cache, current, user_id, None).await? {
+            LatestEventValue::Remote(event) => {
+                Some((event.event_id().unwrap().to_owned(), event.kind.encryption_info().is_some()))
+            }
+            LatestEventValue::None => None,
+            other => panic!("unexpected value {other:?}"),
+        }
+    }
+
+    fn redacted_message(f: &EventFactory, event_id: &EventId) -> TimelineEvent {
+        f.redacted(
+            user_id!("@mnt_io:matrix.org"),
+            ruma::events::room::message::RedactedRoomMessageEventContent::new(),
+        )
+        .event_id(event_id)
+        .into()
+    }
+
+    /// The only candidate is redacted: the value is erased, and so is a value
+    /// that is kept when older events are not candidates either.
+    #[async_test]
+    async fn test_remote_redacted_sole_candidate_erases_the_value() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let m = event_id!("$m");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![redacted_message(&f, m), f.redaction(m).event_id(event_id!("$r")).into()],
+        )
+        .await;
+
+        let value = Builder::new_remote(
+            &room_event_cache,
+            LatestEventValue::Remote(remote_room_message(m, "hello")),
+            user_id,
+            None,
+        )
+        .await;
+        assert_matches!(value, Some(LatestEventValue::None));
+    }
+
+    #[async_test]
+    async fn test_remote_redacted_sole_candidate_after_an_unsuitable_event_erases_the_value() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let m = event_id!("$m");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                f.reaction(event_id!("$other"), "+").event_id(event_id!("$a")).into(),
+                redacted_message(&f, m),
+                f.redaction(m).event_id(event_id!("$r")).into(),
+            ],
+        )
+        .await;
+
+        let value = Builder::new_remote(
+            &room_event_cache,
+            LatestEventValue::Remote(remote_room_message(m, "hello")),
+            user_id,
+            None,
+        )
+        .await;
+        assert_matches!(value, Some(LatestEventValue::None));
+    }
+
+    /// The value is an edit and its original is redacted: the edit goes too.
+    #[async_test]
+    async fn test_remote_redacted_original_erases_an_edit_value() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let (o, e1) = (event_id!("$o"), event_id!("$e1"));
+        let edit: TimelineEvent = f
+            .text_msg("* edited")
+            .event_id(e1)
+            .edit(o, RoomMessageEventContent::text_plain("edited").into())
+            .into();
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                redacted_message(&f, o),
+                edit.clone(),
+                f.redaction(o).event_id(event_id!("$r")).into(),
+            ],
+        )
+        .await;
+
+        let value =
+            Builder::new_remote(&room_event_cache, LatestEventValue::Remote(edit), user_id, None)
+                .await;
+        assert_matches!(value, Some(LatestEventValue::None));
+    }
+
+    /// A clear edit after an encrypted one of a clear message: the clear edit
+    /// is the value, and it arrived in the clear, which the room row shows
+    /// as red.
+    #[async_test]
+    async fn test_remote_clear_edit_after_an_encrypted_edit_is_the_clear_value() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let o = event_id!("$o");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                f.text_msg("hello").event_id(o).into(),
+                decrypted(
+                    f.text_msg("* secret")
+                        .event_id(event_id!("$e1"))
+                        .edit(o, RoomMessageEventContent::text_plain("secret").into())
+                        .into_raw_timeline(),
+                    user_id,
+                ),
+                f.text_msg("* clear")
+                    .event_id(event_id!("$e2"))
+                    .edit(o, RoomMessageEventContent::text_plain("clear").into())
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_value(&room_event_cache, LatestEventValue::None, user_id).await,
+            Some((owned_event_id!("$e2"), false))
+        );
+    }
+
+    /// An encrypted message refuses a clear edit: the original stays the value.
+    #[async_test]
+    async fn test_remote_clear_edit_of_an_encrypted_message_is_refused() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let o = event_id!("$o");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                decrypted(f.text_msg("secret").event_id(o).into_raw_timeline(), user_id),
+                f.text_msg("* forged")
+                    .event_id(event_id!("$e1"))
+                    .edit(o, RoomMessageEventContent::text_plain("forged").into())
+                    .into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_value(&room_event_cache, LatestEventValue::None, user_id).await,
+            Some((owned_event_id!("$o"), true))
+        );
+    }
+
+    /// Same for an encrypted poll and a clear poll edit.
+    #[async_test]
+    async fn test_remote_clear_poll_edit_of_an_encrypted_poll_is_refused() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let p = event_id!("$poll");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                decrypted(
+                    f.poll_start("old?", "old?", vec!["yes", "no"]).event_id(p).into_raw_timeline(),
+                    user_id,
+                ),
+                f.poll_edit(p, "forged?", vec!["yes", "no"]).event_id(event_id!("$e1")).into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_value(&room_event_cache, LatestEventValue::None, user_id).await,
+            Some((owned_event_id!("$poll"), true))
+        );
+    }
+
+    /// A poll edit aimed at a message does not replace it.
+    #[async_test]
+    async fn test_remote_poll_edit_of_a_message_does_not_replace_it() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let m = event_id!("$m");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                f.text_msg("hello").event_id(m).into(),
+                f.poll_edit(m, "poll?", vec!["yes", "no"]).event_id(event_id!("$e1")).into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_value(&room_event_cache, LatestEventValue::None, user_id).await,
+            Some((owned_event_id!("$m"), false))
+        );
+    }
+
+    /// An edit that comes after the poll ended is still the value: the room row
+    /// follows the newest valid edit, while the timeline refuses to edit an
+    /// ended poll. The two disagree (recorded on the issue).
+    #[async_test]
+    async fn test_remote_poll_edit_after_the_end_is_the_value() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let p = event_id!("$poll");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![
+                f.poll_start("old?", "old?", vec!["yes", "no"]).event_id(p).into(),
+                f.poll_end("ended", p).event_id(event_id!("$end")).into(),
+                f.poll_edit(p, "new?", vec!["yes", "no"]).event_id(event_id!("$e1")).into(),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            remote_value(&room_event_cache, LatestEventValue::None, user_id).await,
+            Some((owned_event_id!("$e1"), false))
         );
     }
 
