@@ -266,13 +266,17 @@ impl StateLock {
         // Clear all the events.
         guard.store.clear_all_events(room_id).await?;
 
-        // At this point, all the in-memory `LinkedChunk`s are desynchronised
-        // from the storage. Resynchronise them manually by reloading them.
+        // At this point, the in-memory `LinkedChunk`s of the cleared room(s) are
+        // desynchronised from the storage. Resynchronise them manually by reloading
+        // them.
         guard.reload(ReloadPreprocessing::ForgetAll, room_id).await?;
 
-        if EventCacheStoreLockGuard::is_dirty(&guard.store) {
-            // All good because the state has been reloaded, mark the
-            // cross-process lock as non-dirty.
+        // Only a clear of all the rooms has reloaded every room, so only then can the
+        // cross-process lock be marked as non-dirty. When a single room has been
+        // cleared, the other rooms are out of date if another process wrote to the
+        // store: the lock stays dirty (if it was) so that the next read or write
+        // reloads every room.
+        if room_id.is_none() && EventCacheStoreLockGuard::is_dirty(&guard.store) {
             EventCacheStoreLockGuard::clear_dirty(&guard.store);
         }
 

@@ -26,12 +26,12 @@ use matrix_sdk_base::event_cache::{
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
-    EventId, event_id,
+    EventId, RoomId, event_id,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, TimelineEventType,
         room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
     },
-    room_id,
+    owned_event_id, room_id,
     room_version_rules::RedactionRules,
     user_id,
 };
@@ -2645,6 +2645,92 @@ async fn clear_or_forget_one_of_two_loaded_rooms(forget: bool) {
     let (events, _) = room_event_cache_b.subscribe().await.unwrap();
     assert_eq!(events.len(), 1, "the neighbour's events were cleared from memory");
     assert!(updates_b.is_empty(), "the neighbour was notified");
+}
+
+/// Two processes share the store. Process 1 writes to room b, then process 0
+/// clears or forgets room a. The lock of process 0 is dirty: room b of process
+/// 0 is out of date, and must be reloaded on its next use, not forgotten about
+/// because the scoped clear marked the lock as clean.
+async fn clear_or_forget_a_room_with_a_dirty_lock(forget: bool) {
+    let server = MatrixMockServer::new().await;
+    let event_cache_store = Arc::new(MemoryStore::new());
+
+    let build = |name: &'static str| {
+        let store = event_cache_store.clone();
+        let server = &server;
+        async move {
+            server
+                .client_builder()
+                .on_builder(move |builder| {
+                    builder.store_config(
+                        StoreConfig::new(CrossProcessLockConfig::multi_process(name))
+                            .event_cache_store(store),
+                    )
+                })
+                .build()
+                .await
+        }
+    };
+    let client_0 = build("process_0").await;
+    let client_1 = build("process_1").await;
+    client_0.event_cache().subscribe().unwrap();
+    client_1.event_cache().subscribe().unwrap();
+
+    let room_a = room_id!("!a:saucisse.bzh");
+    let room_b = room_id!("!b:saucisse.bzh");
+    let event = |room_id: &RoomId, id: &EventId| {
+        EventFactory::new().room(room_id).sender(*BOB).text_msg("hi").event_id(id).into_raw_sync()
+    };
+
+    // Process 0 knows room a and room b, with `$b1`.
+    server
+        .sync_room(
+            &client_0,
+            JoinedRoomBuilder::new(room_a).add_timeline_bulk(vec![event(room_a, event_id!("$a1"))]),
+        )
+        .await;
+    let room = server
+        .sync_room(
+            &client_0,
+            JoinedRoomBuilder::new(room_b).add_timeline_bulk(vec![event(room_b, event_id!("$b1"))]),
+        )
+        .await;
+    let (room_event_cache_b, _drop_handles) = room.event_cache().await.unwrap();
+    assert_eq!(room_event_cache_b.events().await.unwrap().len(), 1);
+
+    // Process 1 writes `$b2` to room b: the lock of process 0 is dirty now.
+    server
+        .sync_room(
+            &client_1,
+            JoinedRoomBuilder::new(room_b).add_timeline_bulk(vec![event(room_b, event_id!("$b2"))]),
+        )
+        .await;
+
+    if forget {
+        client_0.event_cache().forget_room(room_a).await.unwrap();
+    } else {
+        client_0.event_cache().clear_room(room_a).await.unwrap();
+    }
+
+    // Room b of process 0 catches up with the store on its next use.
+    let ids = room_event_cache_b
+        .events()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|event| event.event_id().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![owned_event_id!("$b1"), owned_event_id!("$b2")]);
+}
+
+#[async_test]
+async fn test_clear_room_with_a_dirty_lock_reloads_the_other_rooms_later() {
+    clear_or_forget_a_room_with_a_dirty_lock(false).await;
+}
+
+#[async_test]
+async fn test_forget_room_with_a_dirty_lock_reloads_the_other_rooms_later() {
+    clear_or_forget_a_room_with_a_dirty_lock(true).await;
 }
 
 #[async_test]
