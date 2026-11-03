@@ -57,15 +57,21 @@ pub(super) struct LatestEvent {
 }
 
 impl LatestEvent {
-    pub fn new(
-        weak_room: &WeakRoom,
-        thread_id: Option<&EventId>,
-    ) -> With<Self, IsLatestEventValueNone> {
+    pub fn new(weak_room: &WeakRoom, thread_id: Option<&EventId>) -> With<Self, MustRecompute> {
         let latest_event_value = match thread_id {
             Some(_thread_id) => LatestEventValue::default(),
             None => weak_room.get().map(|room| room.latest_event()).unwrap_or_default(),
         };
-        let is_none = latest_event_value.is_none();
+        // A value restored from the store is recomputed if it is none, and also if it
+        // is a replacement: it was computed by a version that did not validate
+        // the edits of polls, and an edit that is not valid must not be shown.
+        let must_recompute = latest_event_value.is_none()
+            || match (&latest_event_value, weak_room.get()) {
+                (LatestEventValue::Remote(event), Some(room)) => {
+                    Builder::edited_event_id(event, room.own_user_id(), None).is_some()
+                }
+                _ => false,
+            };
 
         With {
             result: Self {
@@ -74,7 +80,7 @@ impl LatestEvent {
                 buffer_of_values_for_local_events: BufferOfValuesForLocalEvents::new(),
                 current_value: SharedObservable::new_async(latest_event_value),
             },
-            with: is_none,
+            with: must_recompute,
         }
     }
 
@@ -331,7 +337,7 @@ impl<T, W> DerefMut for With<T, W> {
     }
 }
 
-pub(super) type IsLatestEventValueNone = bool;
+pub(super) type MustRecompute = bool;
 
 #[cfg(all(not(target_family = "wasm"), test))]
 mod tests_latest_event {

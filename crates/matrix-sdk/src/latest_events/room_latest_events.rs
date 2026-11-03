@@ -21,7 +21,7 @@ use tracing::{debug, error, instrument, warn};
 
 use super::{
     LatestEvent, filter_timeline_event,
-    latest_event::{IsLatestEventValueNone, NeedMoreEvents, With},
+    latest_event::{MustRecompute, NeedMoreEvents, With},
 };
 use crate::{
     Room,
@@ -42,10 +42,7 @@ pub(super) struct RoomLatestEvents {
 
 impl RoomLatestEvents {
     /// Create a new [`RoomLatestEvents`].
-    pub fn new(
-        weak_room: WeakRoom,
-        event_cache: &EventCache,
-    ) -> With<Self, IsLatestEventValueNone> {
+    pub fn new(weak_room: WeakRoom, event_cache: &EventCache) -> With<Self, MustRecompute> {
         let latest_event_with = Self::create_latest_event(&weak_room, None);
 
         With::map(latest_event_with, |for_the_room| Self {
@@ -62,7 +59,7 @@ impl RoomLatestEvents {
     fn create_latest_event(
         weak_room: &WeakRoom,
         thread_id: Option<&EventId>,
-    ) -> With<LatestEvent, IsLatestEventValueNone> {
+    ) -> With<LatestEvent, MustRecompute> {
         LatestEvent::new(weak_room, thread_id)
     }
 

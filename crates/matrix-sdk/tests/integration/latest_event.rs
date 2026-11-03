@@ -102,6 +102,22 @@ async fn wait_for_latest_event(
     }
 }
 
+/// The latest event stored in the room info (what the next start restores)
+/// becomes the expected one.
+async fn wait_for_stored_latest_event(room: &matrix_sdk::Room, expected: &ruma::EventId) {
+    let wait = async {
+        while room.latest_event().event_id().as_deref() != Some(expected) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.is_err() {
+        panic!(
+            "the stored latest event never was {expected}, it is {:?}",
+            room.latest_event().event_id()
+        );
+    }
+}
+
 /// B's original, B's early edit, B's late edit and C's forged edit reach the
 /// room by sync; the late edit is then redacted by sync. The chat list's
 /// latest event must go back to the early edit, not stay on the late one.
@@ -120,7 +136,7 @@ async fn test_latest_event_after_the_newest_edit_is_redacted() {
     let client = server.client_builder().build().await;
     client.event_cache().subscribe().unwrap();
 
-    let _room = server.sync_joined_room(&client, &room_id).await;
+    let room = server.sync_joined_room(&client, &room_id).await;
     let mut stream =
         client.latest_events().await.listen_and_subscribe_to_room(&room_id).await.unwrap().unwrap();
 
@@ -147,6 +163,7 @@ async fn test_latest_event_after_the_newest_edit_is_redacted() {
 
     // The forged edit is ignored: the late edit is the latest event.
     wait_for_latest_event(&mut stream, late).await;
+    wait_for_stored_latest_event(&room, late).await;
 
     server
         .mock_sync()
@@ -158,4 +175,55 @@ async fn test_latest_event_after_the_newest_edit_is_redacted() {
         .await;
 
     wait_for_latest_event(&mut stream, early).await;
+    wait_for_stored_latest_event(&room, early).await;
+}
+
+/// The only message of the room is redacted: the latest event goes away, in the
+/// value and in what is stored for the next start.
+#[async_test]
+async fn test_latest_event_after_the_only_message_is_redacted() {
+    let room_id = owned_room_id!("!r0");
+    let bob = user_id!("@bob:local");
+    let message = event_id!("$message");
+    let event_factory = EventFactory::new().room(&room_id).sender(bob);
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+
+    let room = server.sync_joined_room(&client, &room_id).await;
+    let mut stream =
+        client.latest_events().await.listen_and_subscribe_to_room(&room_id).await.unwrap().unwrap();
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |sync_builder| {
+            sync_builder.add_joined_room(
+                JoinedRoomBuilder::new(&room_id)
+                    .add_timeline_event(event_factory.text_msg("hello").event_id(message)),
+            );
+        })
+        .await;
+    wait_for_latest_event(&mut stream, message).await;
+    wait_for_stored_latest_event(&room, message).await;
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |sync_builder| {
+            sync_builder.add_joined_room(
+                JoinedRoomBuilder::new(&room_id)
+                    .add_timeline_event(event_factory.redaction(message)),
+            );
+        })
+        .await;
+
+    let wait = async {
+        while room.latest_event().event_id().is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap_or_else(|_| {
+        panic!("the stored latest event is {:?}", room.latest_event().event_id())
+    });
+    assert!(stream.next_now().await.is_none());
 }

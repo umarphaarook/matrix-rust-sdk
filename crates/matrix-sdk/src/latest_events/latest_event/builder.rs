@@ -66,12 +66,7 @@ impl Builder {
         // edit away with it, so such a redaction erases the current value too.
         let event_edited_by_current_value = match &current_event {
             LatestEventValue::Remote(event) => {
-                match filter_timeline_event(event, None, own_user_id, power_levels) {
-                    ControlFlow::Continue(FilterContinue { edited_event_id, .. }) => {
-                        edited_event_id
-                    }
-                    ControlFlow::Break(()) => None,
-                }
+                Self::edited_event_id(event, own_user_id, power_levels)
             }
             _ => None,
         };
@@ -167,6 +162,19 @@ impl Builder {
             }
 
             current_value_must_be_erased.then(LatestEventValue::default)
+        }
+    }
+
+    /// The ID of the event the given event replaces, if it is a replacement
+    /// (an edit).
+    pub fn edited_event_id(
+        event: &TimelineEvent,
+        own_user_id: &UserId,
+        power_levels: Option<&RoomPowerLevels>,
+    ) -> Option<OwnedEventId> {
+        match filter_timeline_event(event, None, own_user_id, power_levels) {
+            ControlFlow::Continue(FilterContinue { edited_event_id, .. }) => edited_event_id,
+            ControlFlow::Break(()) => None,
         }
     }
 

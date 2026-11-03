@@ -279,21 +279,21 @@ impl RegisteredRooms {
             event_cache: &EventCache,
             latest_event_queue_sender: &mpsc::UnboundedSender<LatestEventQueueUpdate>,
         ) {
-            let (room_latest_events, is_latest_event_value_none) =
-                With::unzip(RoomLatestEvents::new(
-                    WeakRoom::new(weak_client.clone(), room_id.to_owned()),
-                    event_cache,
-                ));
+            let (room_latest_events, must_recompute) = With::unzip(RoomLatestEvents::new(
+                WeakRoom::new(weak_client.clone(), room_id.to_owned()),
+                event_cache,
+            ));
 
             // Insert the new `RoomLatestEvents`.
             rooms.insert(room_id.to_owned(), room_latest_events);
 
             // If the `LatestEventValue` restored by `RoomLatestEvents` is of kind `None`,
-            // let's try to re-compute it without waiting on the Event Cache (so the sync
-            // usually) or the Send Queue. Maybe the system has migrated to a new version
-            // and the `LatestEventValue` has been erased, while it is still possible to
-            // compute a correct value.
-            if is_latest_event_value_none {
+            // or is a replacement (an edit), let's try to re-compute it without waiting
+            // on the Event Cache (so the sync usually) or the Send Queue. Maybe the
+            // system has migrated to a new version and the `LatestEventValue` has been
+            // erased, while it is still possible to compute a correct value. Or the
+            // edit was stored by a version that did not validate it.
+            if must_recompute {
                 let _ = latest_event_queue_sender
                     .send(LatestEventQueueUpdate::EventCache { room_id: room_id.to_owned() });
             }
@@ -669,7 +669,7 @@ mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
         RoomState,
-        deserialized_responses::TimelineEventKind,
+        deserialized_responses::{TimelineEvent, TimelineEventKind},
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     };
     use matrix_sdk_test::{
@@ -1430,6 +1430,134 @@ mod tests {
             );
             assert!(latest_event_queue_receiver.is_empty());
         }
+    }
+
+    /// A forged poll edit was stored as the latest event by a version that did
+    /// not validate poll edits. Once restored, it is recomputed from the Event
+    /// Cache and replaced by the poll itself.
+    #[async_test]
+    async fn test_restored_forged_poll_edit_is_recomputed() {
+        let room_id = owned_room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(&room_id);
+        let poll_id = event_id!("$poll");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room = client.base_client().get_or_create_room(&room_id, RoomState::Joined);
+
+        let forged: TimelineEvent = event_factory
+            .poll_edit(poll_id, "forged?", vec!["yes", "no"])
+            .sender(user_id!("@malory:example.org"))
+            .event_id(event_id!("$forged"))
+            .into();
+
+        // The forged edit is the restored value, and the Event Cache has the poll and
+        // the forged edit.
+        let mut room_info = room.clone_info();
+        room_info.set_latest_event(LatestEventValue::Remote(forged.clone()));
+        room.update_room_info(|_| (room_info, Default::default())).await;
+
+        client
+            .event_cache_store()
+            .lock()
+            .await
+            .expect("Could not acquire the event cache lock")
+            .as_clean()
+            .expect("Could not acquire a clean event cache lock")
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(&room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![
+                            event_factory
+                                .poll_start("old?", "old?", vec!["yes", "no"])
+                                .event_id(poll_id)
+                                .into(),
+                            forged,
+                        ],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        client.event_cache().subscribe().unwrap();
+
+        let latest_events = client.latest_events().await;
+        let mut latest_event_stream =
+            latest_events.listen_and_subscribe_to_room(&room_id).await.unwrap().unwrap();
+
+        // The restored value is the first one, then comes the recomputed one.
+        let mut value = latest_event_stream.next_now().await;
+        if value.event_id().as_deref() != Some(poll_id) {
+            value = timeout(Duration::from_secs(5), latest_event_stream.next())
+                .await
+                .expect("a recomputed value")
+                .expect("the stream is open");
+        }
+        assert_eq!(value.event_id().as_deref(), Some(poll_id));
+
+        // And it is what has been stored, for the next time.
+        assert_eq!(room.latest_event().event_id().as_deref(), Some(poll_id));
+    }
+
+    /// Only a restored replacement (or no value) is recomputed: a restored
+    /// message is kept as it is.
+    #[async_test]
+    async fn test_restored_replacement_is_recomputed_but_not_a_message() {
+        let room_id_0 = owned_room_id!("!r0");
+        let room_id_1 = owned_room_id!("!r1");
+        let user_id = user_id!("@mnt_io:matrix.org");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_0 = client.base_client().get_or_create_room(&room_id_0, RoomState::Joined);
+        let room_1 = client.base_client().get_or_create_room(&room_id_1, RoomState::Joined);
+
+        let f = EventFactory::new().sender(user_id);
+        let mut room_info_0 = room_0.clone_info();
+        room_info_0.set_latest_event(LatestEventValue::Remote(
+            f.poll_edit(event_id!("$poll"), "new?", vec!["yes", "no"])
+                .event_id(event_id!("$edit"))
+                .into(),
+        ));
+        room_0.update_room_info(|_| (room_info_0, Default::default())).await;
+        let mut room_info_1 = room_1.clone_info();
+        room_info_1.set_latest_event(LatestEventValue::Remote(
+            f.text_msg("hello").event_id(event_id!("$msg")).into(),
+        ));
+        room_1.update_room_info(|_| (room_info_1, Default::default())).await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let (latest_event_queue_sender, mut latest_event_queue_receiver) =
+            mpsc::unbounded_channel();
+        let registered_rooms = RegisteredRooms::new(
+            WeakClient::from_client(&client),
+            event_cache,
+            &latest_event_queue_sender,
+        );
+
+        drop(registered_rooms.for_room(&room_id_0).await.unwrap().unwrap());
+        assert_matches!(
+            timeout(Duration::from_secs(5), latest_event_queue_receiver.recv()).await.unwrap(),
+            Some(LatestEventQueueUpdate::EventCache { room_id }) => {
+                assert_eq!(room_id, room_id_0);
+            }
+        );
+
+        drop(registered_rooms.for_room(&room_id_1).await.unwrap().unwrap());
+        assert!(latest_event_queue_receiver.is_empty());
     }
 
     #[async_test]
