@@ -39,14 +39,34 @@ use ruma::{
 };
 use tracing::{debug, error};
 
+use super::ComputeReason;
 use crate::{Room, event_cache::RoomEventCache, room::Invite, send_queue::RoomSendQueueUpdate};
 
 /// A builder of [`LatestEventValue`]s.
 pub(super) struct Builder;
 
 impl Builder {
-    /// Create a new [`LatestEventValue::Remote`].
+    /// Create a new [`LatestEventValue::Remote`], after an update of the
+    /// event cache.
     pub async fn new_remote(
+        room_event_cache: &RoomEventCache,
+        current_event: LatestEventValue,
+        own_user_id: &UserId,
+        power_levels: Option<&RoomPowerLevels>,
+    ) -> Option<LatestEventValue> {
+        Self::new_remote_for(
+            ComputeReason::EventCacheUpdate,
+            room_event_cache,
+            current_event,
+            own_user_id,
+            power_levels,
+        )
+        .await
+    }
+
+    /// Create a new [`LatestEventValue::Remote`] for the given reason.
+    pub async fn new_remote_for(
+        reason: ComputeReason,
         room_event_cache: &RoomEventCache,
         current_event: LatestEventValue,
         own_user_id: &UserId,
@@ -74,7 +94,7 @@ impl Builder {
         // Track the edits of each event, newest first (the scan goes backwards).
         let mut edits_for_event: HashMap<OwnedEventId, Vec<TimelineEvent>> = HashMap::new();
 
-        if let Ok(Some(event)) = room_event_cache
+        let scan = room_event_cache
             .rfind_map_event_in_memory_by(|event| {
                 // At least one event lives in-memory: we consider the room is not empty.
                 room_has_been_emptied = false;
@@ -152,16 +172,38 @@ impl Builder {
                     }
                 }
             })
-            .await
-        {
-            Some(LatestEventValue::Remote(event))
-        } else {
-            // When the room has been emptied, we must erase any previous value.
-            if room_has_been_emptied {
-                current_value_must_be_erased = true;
-            }
+            .await;
 
-            current_value_must_be_erased.then(LatestEventValue::default)
+        // An event cache that is empty because nothing was loaded yet says nothing of
+        // the room: only an update of the event cache tells that it has been emptied.
+        let room_has_been_emptied =
+            room_has_been_emptied && reason == ComputeReason::EventCacheUpdate;
+
+        Self::conclude_scan(scan, room_has_been_emptied, current_value_must_be_erased)
+    }
+
+    /// What a scan of the event cache means for the latest event value.
+    ///
+    /// A scan that failed (the state can't be read) says nothing: the current
+    /// value must stay as it is, not be taken for the value of an emptied
+    /// room.
+    fn conclude_scan(
+        scan: crate::event_cache::Result<Option<TimelineEvent>>,
+        room_has_been_emptied: bool,
+        current_value_must_be_erased: bool,
+    ) -> Option<LatestEventValue> {
+        match scan {
+            Ok(Some(event)) => Some(LatestEventValue::Remote(event)),
+            Ok(None) => {
+                // When the room has been emptied, we must erase any previous value.
+                (room_has_been_emptied || current_value_must_be_erased)
+                    .then(LatestEventValue::default)
+            }
+            Err(error) => {
+                error!(?error, "Failed to scan the event cache for a latest event");
+
+                None
+            }
         }
     }
 
@@ -1771,8 +1813,8 @@ mod builder_tests {
     use serde_json::json;
 
     use super::{
-        super::RemoteLatestEventValue, BufferOfValuesForLocalEvents, Builder, LatestEventValue,
-        RoomEventCache, RoomSendQueueUpdate,
+        super::RemoteLatestEventValue, BufferOfValuesForLocalEvents, Builder, ComputeReason,
+        LatestEventValue, RoomEventCache, RoomSendQueueUpdate,
     };
     use crate::{
         Client, Error,
@@ -2918,6 +2960,98 @@ mod builder_tests {
                 Builder::new_remote(&room_event_cache, LatestEventValue::None, user_id, None).await
             ),
             Some(owned_event_id!("$edit"))
+        );
+    }
+
+    /// A restored latest event that is an edit stays while the event cache
+    /// holds nothing, whereas an update of the event cache that finds
+    /// nothing means an emptied room.
+    #[async_test]
+    async fn test_remote_restored_edit_stays_while_the_event_cache_is_empty() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let edit: TimelineEvent = f
+            .text_msg("* edited")
+            .event_id(event_id!("$e"))
+            .edit(event_id!("$o"), RoomMessageEventContent::text_plain("edited").into())
+            .into();
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(room_id, vec![]).await;
+
+        // Restored: nothing is known yet, nothing changes.
+        assert_matches!(
+            Builder::new_remote_for(
+                ComputeReason::Restored,
+                &room_event_cache,
+                LatestEventValue::Remote(edit.clone()),
+                user_id,
+                None,
+            )
+            .await,
+            None
+        );
+
+        // An update of the event cache that finds nothing: the room is emptied.
+        assert_matches!(
+            Builder::new_remote_for(
+                ComputeReason::EventCacheUpdate,
+                &room_event_cache,
+                LatestEventValue::Remote(edit),
+                user_id,
+                None,
+            )
+            .await,
+            Some(LatestEventValue::None)
+        );
+    }
+
+    /// A restored value is still erased when the event cache shows that it was
+    /// redacted.
+    #[async_test]
+    async fn test_remote_restored_value_is_erased_when_redacted() {
+        let room_id = room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let f = EventFactory::new().sender(user_id).room(room_id);
+        let m = event_id!("$m");
+
+        let (_server, _client, room_event_cache) = room_event_cache_with(
+            room_id,
+            vec![redacted_message(&f, m), f.redaction(m).event_id(event_id!("$r")).into()],
+        )
+        .await;
+
+        assert_matches!(
+            Builder::new_remote_for(
+                ComputeReason::Restored,
+                &room_event_cache,
+                LatestEventValue::Remote(remote_room_message(m, "hello")),
+                user_id,
+                None,
+            )
+            .await,
+            Some(LatestEventValue::None)
+        );
+    }
+
+    /// A scan that failed changes nothing, while one that found nothing can
+    /// mean an emptied room.
+    #[test]
+    fn test_remote_failed_scan_changes_nothing() {
+        use crate::event_cache::EventCacheError;
+
+        assert_matches!(
+            Builder::conclude_scan(Err(EventCacheError::ClientDropped), true, true),
+            None
+        );
+        assert_matches!(
+            Builder::conclude_scan(Ok(None), true, false),
+            Some(LatestEventValue::None)
+        );
+        assert_matches!(Builder::conclude_scan(Ok(None), false, false), None);
+        assert_matches!(
+            Builder::conclude_scan(Ok(None), false, true),
+            Some(LatestEventValue::None)
         );
     }
 

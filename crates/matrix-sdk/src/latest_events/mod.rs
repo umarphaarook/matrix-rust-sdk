@@ -59,7 +59,7 @@ use std::{
 pub use error::LatestEventsError;
 use eyeball::{AsyncLock, Subscriber};
 pub(crate) use latest_event::filter_timeline_event;
-use latest_event::{LatestEvent, With};
+use latest_event::{ComputeReason, LatestEvent, With};
 pub use latest_event::{LatestEventValue, LocalLatestEventValue, RemoteLatestEventValue};
 use matrix_sdk_base::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, timer};
 use matrix_sdk_common::executor::{AbortOnDrop, JoinHandleExt as _, spawn};
@@ -294,8 +294,10 @@ impl RegisteredRooms {
             // erased, while it is still possible to compute a correct value. Or the
             // edit was stored by a version that did not validate it.
             if must_recompute {
-                let _ = latest_event_queue_sender
-                    .send(LatestEventQueueUpdate::EventCache { room_id: room_id.to_owned() });
+                let _ = latest_event_queue_sender.send(LatestEventQueueUpdate::EventCache {
+                    room_id: room_id.to_owned(),
+                    reason: ComputeReason::Restored,
+                });
             }
         }
 
@@ -430,6 +432,9 @@ enum LatestEventQueueUpdate {
     EventCache {
         /// The ID of the room that has triggered the update.
         room_id: OwnedRoomId,
+
+        /// Why the latest event must be computed from the event cache.
+        reason: ComputeReason,
     },
 
     /// An update from the [`SendQueue`] happened.
@@ -507,7 +512,8 @@ async fn listen_to_updates(
             if let Ok(RoomEventCacheGenericUpdate { room_id }) = room_event_cache_generic_update {
                 if registered_rooms.read().await.contains_key(&room_id) {
                     let _ = latest_event_queue_sender.send(LatestEventQueueUpdate::EventCache {
-                        room_id
+                        room_id,
+                        reason: ComputeReason::EventCacheUpdate,
                     });
                 }
             } else {
@@ -612,14 +618,14 @@ async fn compute_latest_events(
 
     for latest_event_queue_update in latest_event_queue_updates {
         match latest_event_queue_update {
-            LatestEventQueueUpdate::EventCache { room_id } => {
+            LatestEventQueueUpdate::EventCache { room_id, reason } => {
                 let ControlFlow::Break(mut room_latest_events) =
                     room_latest_events_write_guard(registered_rooms, room_id).await
                 else {
                     continue;
                 };
 
-                room_latest_events.update_with_event_cache().await;
+                room_latest_events.update_with_event_cache(*reason).await;
             }
 
             LatestEventQueueUpdate::SendQueue { room_id, update } => {
@@ -1413,7 +1419,7 @@ mod tests {
             );
             assert_matches!(
                 latest_event_queue_receiver.recv().await,
-                Some(LatestEventQueueUpdate::EventCache { room_id }) => {
+                Some(LatestEventQueueUpdate::EventCache { room_id, .. }) => {
                     assert_eq!(room_id, room_id_0);
                 }
             );
@@ -1551,13 +1557,56 @@ mod tests {
         drop(registered_rooms.for_room(&room_id_0).await.unwrap().unwrap());
         assert_matches!(
             timeout(Duration::from_secs(5), latest_event_queue_receiver.recv()).await.unwrap(),
-            Some(LatestEventQueueUpdate::EventCache { room_id }) => {
+            Some(LatestEventQueueUpdate::EventCache { room_id, .. }) => {
                 assert_eq!(room_id, room_id_0);
             }
         );
 
         drop(registered_rooms.for_room(&room_id_1).await.unwrap().unwrap());
         assert!(latest_event_queue_receiver.is_empty());
+    }
+
+    /// A valid edit is restored as the latest event while the event cache of
+    /// the room holds nothing: the registration recompute must not take
+    /// that for an emptied room and erase it (a restored message is kept,
+    /// so is an edit).
+    #[async_test]
+    async fn test_restored_edit_survives_an_empty_event_cache() {
+        let room_id = owned_room_id!("!r0");
+        let user_id = user_id!("@mnt_io:matrix.org");
+        let event_factory = EventFactory::new().sender(user_id).room(&room_id);
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room = client.base_client().get_or_create_room(&room_id, RoomState::Joined);
+        let edit: TimelineEvent = event_factory
+            .text_msg("* edited")
+            .event_id(event_id!("$edit"))
+            .edit(
+                event_id!("$original"),
+                ruma::events::room::message::RoomMessageEventContent::text_plain("edited").into(),
+            )
+            .into();
+        let mut room_info = room.clone_info();
+        room_info.set_latest_event(LatestEventValue::Remote(edit));
+        room.update_room_info(|_| (room_info, Default::default())).await;
+
+        client.event_cache().subscribe().unwrap();
+
+        let latest_events = client.latest_events().await;
+        let mut latest_event_stream =
+            latest_events.listen_and_subscribe_to_room(&room_id).await.unwrap().unwrap();
+
+        // Let the registration recompute run.
+        yield_now().await;
+        assert!(timeout(Duration::from_millis(500), latest_event_stream.next()).await.is_err());
+
+        assert_eq!(
+            latest_event_stream.next_now().await.event_id().as_deref(),
+            Some(event_id!("$edit"))
+        );
+        assert_eq!(room.latest_event().event_id().as_deref(), Some(event_id!("$edit")));
     }
 
     #[async_test]

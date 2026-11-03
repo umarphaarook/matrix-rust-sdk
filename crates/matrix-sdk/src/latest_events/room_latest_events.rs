@@ -21,7 +21,7 @@ use tracing::{debug, error, instrument, warn};
 
 use super::{
     LatestEvent, filter_timeline_event,
-    latest_event::{MustRecompute, NeedMoreEvents, With},
+    latest_event::{ComputeReason, MustRecompute, NeedMoreEvents, With},
 };
 use crate::{
     Room,
@@ -147,7 +147,7 @@ impl RoomLatestEventsWriteGuard {
 
     /// Update the latest events for the room and its threads, based on the
     /// event cache data.
-    pub async fn update_with_event_cache(&mut self) {
+    pub async fn update_with_event_cache(&mut self, reason: ComputeReason) {
         // Get the power levels of the user for the current room if the `WeakRoom` is
         // still valid.
         //
@@ -190,7 +190,12 @@ impl RoomLatestEventsWriteGuard {
         // in the background until a suitable event surfaces.
         if matches!(
             for_the_room
-                .update_with_event_cache(room_event_cache, own_user_id, power_levels.as_ref())
+                .update_with_event_cache(
+                    room_event_cache,
+                    own_user_id,
+                    power_levels.as_ref(),
+                    reason
+                )
                 .await,
             NeedMoreEvents::Yes
         ) {
@@ -199,7 +204,12 @@ impl RoomLatestEventsWriteGuard {
 
         for latest_event in per_thread.values_mut() {
             latest_event
-                .update_with_event_cache(room_event_cache, own_user_id, power_levels.as_ref())
+                .update_with_event_cache(
+                    room_event_cache,
+                    own_user_id,
+                    power_levels.as_ref(),
+                    reason,
+                )
                 .await;
         }
     }
@@ -413,13 +423,25 @@ mod tests {
 
         let mut updates = event_cache.subscribe_to_room_generic_updates();
 
-        room_latest_events.write().await.update_with_event_cache().await;
+        room_latest_events
+            .write()
+            .await
+            .update_with_event_cache(
+                crate::latest_events::latest_event::ComputeReason::EventCacheUpdate,
+            )
+            .await;
 
         // The backfill runs in the background; wait for the events it loads, then
         // recompute as the update it emits would.
         assert_let_timeout!(Ok(_) = updates.recv());
 
-        room_latest_events.write().await.update_with_event_cache().await;
+        room_latest_events
+            .write()
+            .await
+            .update_with_event_cache(
+                crate::latest_events::latest_event::ComputeReason::EventCacheUpdate,
+            )
+            .await;
 
         // The backfill surfaced the message; the latest event resolved to it.
         assert_matches!(
