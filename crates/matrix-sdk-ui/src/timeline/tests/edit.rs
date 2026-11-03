@@ -935,3 +935,79 @@ async fn quoted_body(timeline: &TestTimeline, reply_id: &EventId) -> String {
     };
     quoted.content.as_message().expect("a quoted message").body().to_owned()
 }
+
+/// Aborting a local redaction puts the message back as it was, including what
+/// later edits are judged against: the original is clear, so the sender's later
+/// clear edit is still valid, although an encrypted edit is on screen.
+#[async_test]
+async fn test_unredacting_keeps_what_edits_are_judged_against() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+
+    timeline.handle_live_event(f.text_msg("original").sender(*ALICE).event_id(original_id)).await;
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("* e1")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e1").into())
+                .event_id(event_id!("$e1"))
+                .room(&DEFAULT_TEST_ROOM_ID),
+            "S_E1",
+        ))
+        .await;
+    assert_eq!(body_of(&item_with_id(&timeline, original_id).await), "e1");
+
+    // Redact the message locally, then abort.
+    let txn_id = timeline.handle_local_redaction(original_id.to_owned()).await;
+    assert!(item_with_id(&timeline, original_id).await.content().is_redacted());
+    assert!(timeline.controller.discard_local_echo(&txn_id).await);
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e1");
+    assert_eq!(session_of(&item).as_deref(), Some("S_E1"));
+
+    // The clear edit is judged against the clear original, not the encrypted
+    // edit on screen.
+    timeline
+        .handle_live_event(
+            f.text_msg("* e2")
+                .sender(*ALICE)
+                .edit(original_id, MessageType::text_plain("e2").into())
+                .event_id(event_id!("$e2")),
+        )
+        .await;
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "e2");
+    assert_eq!(
+        item.get_shield(false),
+        TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+    );
+}
+
+/// A local echo of an edit has no encryption info yet. It must not overwrite
+/// the info of the encrypted message it edits: the shield stays clean until the
+/// remote echo comes.
+#[async_test]
+async fn test_local_edit_echo_keeps_the_info_of_an_encrypted_message() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+
+    timeline
+        .handle_live_event(decrypted(
+            f.text_msg("original").sender(*ALICE).event_id(original_id).room(&DEFAULT_TEST_ROOM_ID),
+            "S_ORIGINAL",
+        ))
+        .await;
+    assert_eq!(
+        item_with_id(&timeline, original_id).await.get_shield(false),
+        TimelineEventShieldState::None
+    );
+
+    timeline.handle_local_event(local_edit(original_id, "edited")).await;
+
+    let item = item_with_id(&timeline, original_id).await;
+    assert_eq!(body_of(&item), "edited");
+    assert_eq!(session_of(&item).as_deref(), Some("S_ORIGINAL"));
+    assert_eq!(item.get_shield(false), TimelineEventShieldState::None);
+}
