@@ -929,7 +929,7 @@ async fn test_redacted_edit_updates_the_quote_in_a_reply() {
 /// The body of the event a reply quotes.
 async fn quoted_body(timeline: &TestTimeline, reply_id: &EventId) -> String {
     let item = item_with_id(timeline, reply_id).await;
-    let details = item.content().in_reply_to().expect("a reply").clone();
+    let details = item.content().in_reply_to().expect("a reply");
     let crate::timeline::TimelineDetails::Ready(quoted) = details.event else {
         panic!("the quoted event isn't ready");
     };
