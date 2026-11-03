@@ -179,7 +179,7 @@ impl StateLock {
                 };
 
                 // Reload the state.
-                guard.reload(ReloadPreprocessing::None).await?;
+                guard.reload(ReloadPreprocessing::None, None).await?;
 
                 // All good now, mark the cross-process lock as non-dirty.
                 EventCacheStoreLockGuard::clear_dirty(&guard.store);
@@ -226,7 +226,7 @@ impl StateLock {
                 };
 
                 // Reload the state.
-                guard.reload(ReloadPreprocessing::None).await?;
+                guard.reload(ReloadPreprocessing::None, None).await?;
 
                 // All good now, mark the cross-process lock as non-dirty.
                 EventCacheStoreLockGuard::clear_dirty(&guard.store);
@@ -268,7 +268,7 @@ impl StateLock {
 
         // At this point, all the in-memory `LinkedChunk`s are desynchronised
         // from the storage. Resynchronise them manually by reloading them.
-        guard.reload(ReloadPreprocessing::ForgetAll).await?;
+        guard.reload(ReloadPreprocessing::ForgetAll, room_id).await?;
 
         if EventCacheStoreLockGuard::is_dirty(&guard.store) {
             // All good because the state has been reloaded, mark the
@@ -485,13 +485,25 @@ impl<'state> ReloadableStateLockWriteGuard<'state> {
         }
     }
 
-    async fn reload(&mut self, preprocessing: ReloadPreprocessing) -> Result<()> {
+    /// Reload the states of all the rooms, or of a single room if `only_room`
+    /// is set. The other rooms are neither reset nor notified: with
+    /// [`ReloadPreprocessing::ForgetAll`], their events would be dropped from
+    /// memory and from the store while only one room was asked to be cleared.
+    async fn reload(
+        &mut self,
+        preprocessing: ReloadPreprocessing,
+        only_room: Option<&RoomId>,
+    ) -> Result<()> {
         trace!("Reloading the state");
 
-        // Iterate over all states and reload them.
+        // Iterate over the states and reload them.
         for (room_id, StateForRoom { room, threads, pinned_events, event_focused }) in
             self.state.by_room.iter_mut()
         {
+            if only_room.is_some_and(|only_room| only_room != room_id) {
+                continue;
+            }
+
             // Room.
             if let Some(room_state) = room {
                 let mut room_state = StateLockWriteGuard {
@@ -678,7 +690,7 @@ where
     /// test.
     #[cfg(test)]
     pub async fn reload_no_preprocessing(&self) -> Result<()> {
-        self.state_lock.write().await?.reload(ReloadPreprocessing::None).await
+        self.state_lock.write().await?.reload(ReloadPreprocessing::None, None).await
     }
 }
 
