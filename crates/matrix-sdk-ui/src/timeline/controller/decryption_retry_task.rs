@@ -16,7 +16,6 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::pin_mut;
 use imbl::Vector;
-use itertools::{Either, Itertools as _};
 use matrix_sdk::{event_cache::RedecryptorReport, task_monitor::BackgroundTaskHandle};
 use tokio_stream::StreamExt as _;
 
@@ -38,30 +37,32 @@ pub(in crate::timeline) struct CryptoDropHandles {
 pub(super) fn compute_redecryption_candidates(
     timeline_items: &Vector<Arc<TimelineItem>>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
-    timeline_items
-        .iter()
-        .filter_map(|event| {
-            event.as_event().and_then(|e| {
-                let session_id = e.encryption_info().and_then(|info| info.session_id());
+    let mut utd_sessions = BTreeSet::new();
+    let mut info_sessions = BTreeSet::new();
 
-                let session_id = if let Some(session_id) = session_id {
-                    Some(session_id)
-                } else {
-                    event.as_event().and_then(|e| {
-                        e.content.as_unable_to_decrypt().and_then(|utd| utd.session_id())
-                    })
-                };
-
-                session_id.map(|id| id.to_owned()).zip(Some(e))
-            })
-        })
-        .partition_map(|(session_id, event)| {
-            if event.content.is_unable_to_decrypt() {
-                Either::Left(session_id)
-            } else {
-                Either::Right(session_id)
+    for event in timeline_items.iter().filter_map(|item| item.as_event()) {
+        if event.content.is_unable_to_decrypt() {
+            if let Some(session_id) =
+                event.content.as_unable_to_decrypt().and_then(|utd| utd.session_id())
+            {
+                utd_sessions.insert(session_id.to_owned());
             }
-        })
+            continue;
+        }
+
+        // The event on screen may be an edit, whose session is not the original's. The
+        // original is what edits are judged against, so its trust must be refreshed
+        // too.
+        for info in
+            [event.encryption_info(), event.original_encryption_info()].into_iter().flatten()
+        {
+            if let Some(session_id) = info.session_id() {
+                info_sessions.insert(session_id.to_owned());
+            }
+        }
+    }
+
+    (utd_sessions, info_sessions)
 }
 
 async fn redecryption_report_task(timeline_controller: TimelineController) {
@@ -215,6 +216,35 @@ mod tests {
         assert!(answer.0.contains("session2"));
         assert!(answer.1.contains("session1"));
         assert!(answer.1.contains("session2"));
+    }
+
+    #[test]
+    fn test_the_original_of_a_shown_edit_is_refetched_too() {
+        // Given a message whose original reached us in session1, with an edit
+        // on screen from session2
+        let timeline = vector![edited_event("session2", "session1")];
+        // When we ask what to retry
+        let answer = compute_redecryption_candidates(&timeline);
+        // Then the info of both sessions is refreshed: edits are judged against
+        // the original's
+        assert!(answer.0.is_empty());
+        assert!(answer.1.contains("session1"));
+        assert!(answer.1.contains("session2"));
+    }
+
+    /// A message showing an edit received in `edit_session`, whose original
+    /// was received in `original_session`.
+    fn edited_event(edit_session: &str, original_session: &str) -> Arc<TimelineItem> {
+        use crate::timeline::event_item::BeforeEdits;
+
+        let item = decrypted_event(edit_session);
+        let mut event = item.as_event().unwrap().clone();
+        let original = decrypted_event(original_session);
+        event.before_edits = Some(Box::new(BeforeEdits {
+            kind: event.content.as_msglike().unwrap().kind.clone(),
+            encryption_info: original.as_event().unwrap().encryption_info().cloned().map(Arc::new),
+        }));
+        TimelineItem::new(TimelineItemKind::Event(event), TimelineUniqueId("edited".to_owned()))
     }
 
     fn date_divider() -> Arc<TimelineItem> {

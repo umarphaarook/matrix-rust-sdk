@@ -320,3 +320,69 @@ async fn test_utd_shield() {
     let shield = item.as_event().unwrap().get_shield(false);
     assert_eq!(shield, TimelineEventShieldState::None);
 }
+
+/// The sender's clear edit after an encrypted one: the text on screen is the
+/// clear edit's, and so is the red "sent in clear" shield. The text is the
+/// server's to write, and the shield says it did not arrive encrypted.
+///
+/// Element Web and the rust SDK's cold path do the same (see the report of the
+/// round); the SDK's live path refuses the clear edit by accident, because it
+/// judges it against the encryption info of the edit on screen.
+#[async_test]
+async fn test_clear_edit_after_an_encrypted_edit_is_red() {
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build().await;
+    let mut stream = timeline.subscribe().await;
+    let f = &timeline.factory;
+    let original_id = event_id!("$original");
+
+    timeline
+        .handle_live_event(f.text_msg("Unencrypted message.").sender(&ALICE).event_id(original_id))
+        .await;
+    assert_next_matches!(stream, VectorDiff::PushBack { .. });
+    assert_next_matches!(stream, VectorDiff::PushFront { .. });
+
+    let encrypted_edit = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: f
+                .text_msg("* Encrypted edit.")
+                .sender(&ALICE)
+                .edit(original_id, RoomMessageEventContent::text_plain("Encrypted edit.").into())
+                .event_id(event_id!("$e1"))
+                .room(&DEFAULT_TEST_ROOM_ID)
+                .into_raw_timeline(),
+            encryption_info: Arc::new(EncryptionInfo {
+                sender: (*ALICE).into(),
+                sender_device: None,
+                forwarder: None,
+                algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                    curve25519_key: "fake_key".to_owned(),
+                    sender_claimed_keys: BTreeMap::new(),
+                    session_id: Some("fake_session".to_owned()),
+                },
+                verification_state: VerificationState::Verified,
+            }),
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
+    timeline.handle_live_event(encrypted_edit).await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    assert_eq!(item.as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
+
+    timeline
+        .handle_live_event(
+            f.text_msg("* Clear edit.")
+                .sender(&ALICE)
+                .edit(original_id, RoomMessageEventContent::text_plain("Clear edit.").into())
+                .event_id(event_id!("$e2")),
+        )
+        .await;
+
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    let item = item.as_event().unwrap();
+    assert_eq!(item.content().as_message().unwrap().body(), "Clear edit.");
+    assert_eq!(
+        item.get_shield(false),
+        TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+    );
+}
